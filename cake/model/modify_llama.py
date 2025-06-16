@@ -20,6 +20,9 @@ from ..cake_cache import CakeCache, CakeDecodingKVCache_LayerWise
 
 from ..utils import calculate_entropy
 
+# modify_llama.py
+
+layer_logs = {}  # global dict to store scores for debugging
 
 
 def llama_attn_forward_cake(
@@ -90,6 +93,7 @@ def llama_attn_forward_cake(
     if self.config.prefill[self.layer_idx]:
         tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+
         if q_len !=1:
             mask = torch.full((self.config.window_size[self.layer_idx], self.config.window_size[self.layer_idx]), torch.finfo(tmp_attn_weights.dtype).min, device=tmp_attn_weights.device)
             mask_cond = torch.arange(mask.size(-1), device=tmp_attn_weights.device)
@@ -100,12 +104,31 @@ def llama_attn_forward_cake(
             tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, -self.config.window_size[self.layer_idx]:] += tmp_attention_mask
 
         tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float64)
+        tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float64)
 
-        disp = calculate_entropy(tmp_attn_weights[:,:,-self.config.window_size[self.layer_idx]:,:-self.config.window_size[self.layer_idx]])
-        var = torch.var(tmp_attn_weights[:,:,-self.config.window_size[self.layer_idx]:,:-self.config.window_size[self.layer_idx]],dim=-2).sum(0).sum(0).sum(0)
 
-        pref_score = (disp**(1/self.config.tau1)*var**(1/self.config.tau2)).cpu().numpy()
+        # disp = calculate_entropy(tmp_attn_weights[:,:,-self.config.window_size[self.layer_idx]:,:-self.config.window_size[self.layer_idx]])
+        # var = torch.var(tmp_attn_weights[:,:,-self.config.window_size[self.layer_idx]:,:-self.config.window_size[self.layer_idx]],dim=-2).sum(0).sum(0).sum(0)
+
+        # print("disp tensor scalar: ", disp)
+        # print("var tensor scalar: ", var)
+        # pref_score = (disp**(1/self.config.tau1)*var**(1/self.config.tau2)).cpu().numpy()
+
+        attn_focus = tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, :-self.config.window_size[self.layer_idx]]  # [B, H, W, L]
+
+        entropy = -torch.sum(attn_focus * torch.log(attn_focus + 1e-10), dim=-1)  # [B, H, W]
+        entropy_per_head = entropy.mean(dim=(0, 2))  # [H]
+
+        variance_per_head = attn_focus.var(dim=-1).mean(dim=(0, 2))  # [H]
+        entropy_per_head = torch.nan_to_num(entropy_per_head, nan=0.0, posinf=0.0, neginf=0.0)
+        variance_per_head = torch.nan_to_num(variance_per_head, nan=0.0, posinf=0.0, neginf=0.0)
+
+        pref_score_per_head = (entropy_per_head ** (1 / self.config.tau1)) * (variance_per_head ** (1 / self.config.tau2))
+        pref_score_per_head = torch.nan_to_num(pref_score_per_head, nan=0.0, posinf=0.0, neginf=0.0)
+        # print("Preference score calculated.")
+
+        # print(f"[CAKE] Layer {self.layer_idx} | pref_score_per_head shape = {pref_score_per_head.shape}")
+        # print(f"[CAKE] Layer {self.layer_idx} | pref_score_per_head sample = {pref_score_per_head[:5].detach().cpu().numpy()}")
 
         #compute preference score and hh score
         attention_score = tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, :] 
@@ -116,11 +139,38 @@ def llama_attn_forward_cake(
         attn_cache = attn_cache[:, :, :-self.config.window_size[self.layer_idx]]
         attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=5//2, stride=1)
 
-        attn_cache = attn_cache.reshape(bsz, self.num_key_value_heads, self.num_key_value_groups, -1)
-        hh_score = attn_cache.mean(dim=-2)
-        past_key_value.update_score(pref_score, hh_score)
+        # attn_cache = attn_cache.reshape(bsz, self.num_key_value_heads, self.num_key_value_groups, -1)
+        # hh_score = attn_cache.mean(dim=-2)
+        hh_score = attn_cache
+        hh_score = torch.nan_to_num(hh_score, nan=0.0, posinf=0.0, neginf=0.0)
+        # print hh_score shape and sample
+        # print(f"[CAKE] Layer {self.layer_idx} | hh_score shape = {hh_score.shape}")
+        # print(f"[CAKE] Layer {self.layer_idx} | hh_score sample = {hh_score[0, 0, :5].detach().cpu().numpy()}")
+
+        # print data type of pref_score and hh_score
+        # print(f"[CAKE] Layer {self.layer_idx} | pref_score type = {type(pref_score)}")
+        # print(f"[CAKE] Layer {self.layer_idx} | hh_score type = {type(hh_score)}")
+        past_key_value.update_score(pref_score_per_head, hh_score)
+        # past_key_value.update_score(pref_score_per_head, hh_score)
 
 
+        #####
+        # print(f"[CAKE] Layer {self.layer_idx} pref_scores per head: {pref_score_per_head}")
+        # print(f"[CAKE] Layer {self.layer_idx} | pref_score scalar = {pref_score}")
+        # print(f"[CAKE] Layer {self.layer_idx} | hh_score shape = {hh_score.shape}")
+        # print(f"[CAKE] Layer {self.layer_idx} | hh_score sample = {hh_score[0, 0, :5].detach().cpu().numpy()}")
+
+        # Ensure the layer entry exists
+        # if self.layer_idx not in layer_logs:
+        #     layer_logs[self.layer_idx] = {"pref": [], "hh": []}
+
+        # Store attention heatmap (already softmaxed above)
+        # attn_for_heatmap = tmp_attn_weights.detach().cpu()
+
+        # if "attn_heatmap" not in layer_logs[self.layer_idx]:
+        #     layer_logs[self.layer_idx]["attn_heatmap"] = []
+
+        # layer_logs[self.layer_idx]["attn_heatmap"].append(attn_for_heatmap)
         past_key_value.layer_budget.append(self.config.key_size[self.layer_idx])
         self.config.prefill[self.layer_idx] =False
         past_key_value = self.config.prefill_cake_evict[self.layer_idx](past_key_value, q_len)

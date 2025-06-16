@@ -1,9 +1,11 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 from transformers.cache_utils import DynamicCache, Cache, HybridCache
 from typing import Any, Dict, List, Optional, Tuple, Union
-from cake.utils import adjust_budgets
+from cake.logger import LongBenchBudgetLogger
+from cake.utils import adjust_budgets, compute_head_budgets, compute_head_budgets_dynamic, analyze_budget_distribution, compute_head_budgets_vanilla_cake
 
 class CakeCache(Cache):
     """
@@ -205,44 +207,88 @@ class CakeprefillKVCache:
     ):
 
         self.window_size = window_size
-        self.total_size = (cache_size-window_size) * num_layers
+        self.total_size = (cache_size-window_size) * num_layers * num_heads # might have to change
         self.cache_size = cache_size
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.use_cascading = use_cascading  # If true, ensure high attention precision
-
+        self.budget_logger = None  # Will be set externally
+        self.silent_mode = True    # Suppress prints during evaluation
         # print(f"CakeprefillKVCache: {self.total_size}, {self.window_size}")
-        
+    def set_budget_logger(self, logger: LongBenchBudgetLogger):
+        """Set the budget logger for this cache"""
+        self.budget_logger = logger
     def __call__(self, past_key_values, seq_len):
         if seq_len<=self.cache_size+self.window_size:
             return past_key_values
 
         pref_scores = past_key_values.pref_scores
-  
-        layer_budgets = [pref_score/sum(pref_scores)*self.total_size for pref_score in pref_scores]
-    
-        layer_budgets = adjust_budgets(layer_budgets, self.total_size, seq_len-self.window_size,  self.num_layers)
+        # print(f"[CAKE] Pref Scores: {pref_scores}")
+        head_budgets = compute_head_budgets_dynamic(
+            pref_scores, 
+            self.total_size,
+            allocation_strategy="entropy_based"  # or get from config
+        )
 
-        if self.use_cascading:
-            layer_idx = 0
-            print(layer_budgets)
-            for budget in layer_budgets:
-                if budget>= seq_len-self.window_size:
-                    budget = seq_len-self.window_size
-                past_key_values = self.evcit_layer_kvcache(past_key_values, layer_idx, budget)
-                past_key_values.layer_budget[layer_idx]=budget
-                layer_idx +=1
-        else:
-            layer_idx = 0
-            if len(layer_budgets) ==self.num_layers:
-                for budget in layer_budgets:
-                    if budget>= seq_len-self.window_size:
-                        budget = seq_len-self.window_size
-                    past_key_values = self.evcit_layer_kvcache(past_key_values, layer_idx, budget)
-                    past_key_values.layer_budget[layer_idx]=budget
-                    layer_idx +=1
+        # vanila CAKE
+        # head_budgets = compute_head_budgets_vanilla_cake(
+        #     pref_scores, 
+        #     self.total_size
+        # )
+
+        # Log allocation for each layer if logger is available
+        if self.budget_logger:
+            for layer_idx in head_budgets:
+                available_tokens = past_key_values.key_cache[layer_idx].shape[2] - self.window_size
+                self.budget_logger.log_layer_allocation(
+                    layer_idx=layer_idx,
+                    head_budgets=head_budgets[layer_idx],
+                    pref_scores=pref_scores[layer_idx],
+                    allocation_strategy="entropy_based",
+                    available_tokens=available_tokens,
+                    window_size=self.window_size
+                )
+
+        # Add analysis
+        # analyze_budget_distribution(head_budgets, pref_scores)
+        #print total budget
+
+        for layer_idx in head_budgets:
+            past_key_values = self.evict_kvcache_headwise(
+                past_key_values,
+                layer_idx,
+                head_budgets[layer_idx],
+                self.window_size
+            )
+            past_key_values.layer_budget[layer_idx] = sum(head_budgets[layer_idx])
+
+        # head_budgets = compute_head_budgets(evict_scores, total_budget=self.total_size, window_size=self.window_size)
+
+  
+        # layer_budgets = [pref_score/sum(pref_scores)*self.total_size for pref_score in pref_scores]
+    
+        # layer_budgets = adjust_budgets(layer_budgets, self.total_size, seq_len-self.window_size,  self.num_layers)
+
+        # if self.use_cascading:
+        #     layer_idx = 0
+        #     print(layer_budgets)
+        #     for budget in layer_budgets:
+        #         if budget>= seq_len-self.window_size:
+        #             budget = seq_len-self.window_size
+        #         past_key_values = self.evcit_layer_kvcache(past_key_values, layer_idx, budget)
+        #         past_key_values.layer_budget[layer_idx]=budget
+        #         layer_idx +=1
+        # else:
+        #     layer_idx = 0
+        #     if len(layer_budgets) ==self.num_layers:
+        #         for budget in layer_budgets:
+        #             if budget>= seq_len-self.window_size:
+        #                 budget = seq_len-self.window_size
+        #             past_key_values = self.evcit_layer_kvcache(past_key_values, layer_idx, budget)
+        #             past_key_values.layer_budget[layer_idx]=budget
+        #             layer_idx +=1
 
         return past_key_values
 
@@ -274,6 +320,144 @@ class CakeprefillKVCache:
 
         return past_key_values
 
+    # def evict_kvcache_headwise(self, past_key_values, layer_idx, head_budgets, window_size):
+    #     """
+    #     Evict tokens per head based on head-specific scores, then pad heads to same length for FlashAttention.
+
+    #     Args:
+    #         past_key_values: CakeCache object
+    #         layer_idx: which layer to compress
+    #         head_budgets: list of ints [H] specifying how many tokens to keep per head
+    #         window_size: number of recent tokens to always keep
+    #     """
+    #     key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
+    #     value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
+    #     hh_score = past_key_values.evict_scores[layer_idx]    # [B, H, S]
+
+    #     B, H, S, D = key_cache.shape
+    #     device = key_cache.device
+
+    #     k_out = []
+    #     v_out = []
+    #     max_len = 0
+
+    #     for h in range(H):
+    #         # Scores excluding the recent window
+    #         scores = hh_score[:, h, :-window_size]  # [B, L - window]
+    #         # available_len = scores.shape[-1]
+
+    #         # k = min(head_budgets[h], available_len)
+    #         # if k <= 0:
+    #         #     topk_idx = torch.empty((B, 0), dtype=torch.long, device=device)
+    #         # else:
+    #         #     topk_idx = scores.topk(k, dim=-1).indices  # [B, k]
+
+    #         available_len = scores.shape[-1]
+    #         print(f"[CAKE] Layer {layer_idx} | Head {h:2d} | Available tokens: {available_len} | Budget: {head_budgets[h]}")
+    #         k = min(max(0, head_budgets[h]), available_len)  # ensure at least 1, but not more than available
+    #         ## I observe that sometimes the budget allocation is 0 but we still keep atleast one token thanks to above line
+    #         topk_idx = scores.topk(k, dim=-1).indices  # [B, k]
+
+
+    #         # Expand index for gathering: [B, k, D]
+    #         gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, D)
+
+    #         # torch.select 
+
+    #         # Gather key/value
+    #         k_selected = key_cache[:, h, :-window_size, :].gather(1, gather_idx)  # [B, k, D]
+    #         v_selected = value_cache[:, h, :-window_size, :].gather(1, gather_idx)
+
+    #         # Append the most recent window
+    #         k_window = key_cache[:, h, -window_size:, :]  # [B, window, D]
+    #         v_window = value_cache[:, h, -window_size:, :]
+
+    #         k_final = torch.cat([k_selected, k_window], dim=1)  # [B, k + window, D]
+    #         v_final = torch.cat([v_selected, v_window], dim=1)
+
+    #         max_len = max(max_len, k_final.shape[1])
+    #         k_out.append(k_final)
+    #         v_out.append(v_final)
+
+    #         retained_len = k_final.shape[1]
+    #         print(f"[CAKE] Layer {layer_idx} | Head {h:2d} retained tokens: {retained_len}")
+
+
+    #     # Pad all heads to max_len for FlashAttention
+    #     k_padded = []
+    #     v_padded = []
+
+    #     for h in range(H):
+    #         k = k_out[h]
+    #         v = v_out[h]
+    #         pad_len = max_len - k.shape[1]
+
+    #         if pad_len > 0:
+    #             pad_k = torch.zeros(B, pad_len, D, device=device, dtype=k.dtype)
+    #             pad_v = torch.zeros(B, pad_len, D, device=device, dtype=v.dtype)
+    #             k = torch.cat([k, pad_k], dim=1)
+    #             v = torch.cat([v, pad_v], dim=1)
+
+    #         k_padded.append(k.unsqueeze(1))  # [B, 1, max_len, D]
+    #         v_padded.append(v.unsqueeze(1))
+
+    #     # Stack across heads
+    #     past_key_values.key_cache[layer_idx] = torch.cat(k_padded, dim=1)  # [B, H, max_len, D]
+    #     past_key_values.value_cache[layer_idx] = torch.cat(v_padded, dim=1)
+
+    #     return past_key_values
+    def evict_kvcache_headwise(self, past_key_values, layer_idx, head_budgets, window_size):
+        """
+        Dynamic budget allocation per head - TESTING MODE (no actual eviction yet)
+        """
+        key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
+        value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
+        hh_score = past_key_values.evict_scores[layer_idx]    # [B, H, S]
+
+        B, H, S, D = key_cache.shape
+        device = key_cache.device
+
+        # print(f"\n[CAKE] Layer {layer_idx} - Dynamic Budget Testing:")
+        # print("-" * 50)
+        
+        # Analyze budget distribution vs uniform allocation
+        uniform_budget = sum(head_budgets) // H
+        total_available = S - window_size
+        
+        # budget_variance = np.var(head_budgets)
+        budget_efficiency = []
+        
+        for h in range(H):
+            allocated_budget = head_budgets[h]
+            available_tokens = total_available
+            
+            # Calculate utilization metrics
+            # utilization = min(allocated_budget / available_tokens, 1.0) * 100 if available_tokens > 0 else 0
+            efficiency = allocated_budget / uniform_budget if uniform_budget > 0 else 1.0
+            
+            budget_efficiency.append(efficiency)
+            
+            # print(f"[CAKE] Layer {layer_idx} | Head {h:2d} | "
+            #     f"Budget: {allocated_budget:3d} (vs uniform: {uniform_budget:3d}) | "
+            #     f"Efficiency: {efficiency:5.2f}x | Utilization: {utilization:5.1f}%")
+        
+        # # Summary statistics
+        # avg_efficiency = np.mean(budget_efficiency)
+        # max_efficiency = np.max(budget_efficiency)
+        # min_efficiency = np.min(budget_efficiency)
+        
+        # print(f"[CAKE] Layer {layer_idx} Summary:")
+        # print(f"  Budget Variance: {budget_variance:.2f}")
+        # print(f"  Efficiency Range: [{min_efficiency:.2f}x - {max_efficiency:.2f}x], Avg: {avg_efficiency:.2f}x")
+        # print(f"  Total Budget: {sum(head_budgets)} (Uniform would be: {uniform_budget * H})")
+        
+        # FOR TESTING: Keep all tokens, just track budget allocation
+        # Later implement actual eviction here
+        
+        return past_key_values
+
+
+    
 class CakeDecodingKVCache_LayerWise:
     def __init__(
         self,

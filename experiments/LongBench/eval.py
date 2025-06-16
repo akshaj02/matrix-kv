@@ -106,9 +106,11 @@ if __name__ == '__main__':
     out_path = f"{path}/result.json"
 
     if args.eval_avg:
-        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
-                     "gov_report", "qmsum", "multi_news",  "trec", "triviaqa", "samsum",\
-                    "passage_count", "passage_retrieval_en",  "lcc", "repobench-p"]
+        # datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+        #              "gov_report", "qmsum", "multi_news",  "trec", "triviaqa", "samsum",\
+        #             "passage_count", "passage_retrieval_en",  "lcc", "repobench-p"]
+        datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
+                    "gov_report"]
 
         all_in_scores = all(dataset in scores for dataset in datasets)
         if all_in_scores:

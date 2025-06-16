@@ -16,6 +16,7 @@ from pathlib import Path
 
 from cake.cake_cache import CakeprefillKVCache 
 from cake.utils import CompressConfig 
+from cake.logger import LongBenchBudgetLogger
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -64,23 +65,78 @@ def build_chat(tokenizer, prompt, model_name):
 
 
 
+# @torch.inference_mode()
+# def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path):
+
+#     for json_obj in tqdm(data):
+#         prompt = prompt_format.format(**json_obj)
+#         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
+#         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+
+#         if len(tokenized_prompt) > max_length:
+#             half = int(max_length/2)
+#             prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+#         if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
+#             prompt = build_chat(tokenizer, prompt, model_name)
+
+#         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+#         context_length = input.input_ids.shape[-1]
+
+#         if dataset == "samsum":
+#             output = model.generate(
+#                 **input,
+#                 max_new_tokens=max_gen,
+#                 num_beams=1,
+#                 do_sample=False,
+#                 temperature=1.0,
+#                 min_length=context_length+1,
+#                 eos_token_id=[tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]],
+#             )[0]
+#         else:
+#             output = model.generate(
+#                 **input,
+#                 max_new_tokens=max_gen,
+#                 num_beams=1,
+#                 do_sample=False,
+#                 temperature=1.0,
+#             )[0]
+  
+
+#         if compress:
+#             layers = len(model.model.layers)
+#             for i in range(layers):
+#                 model.model.layers[i].self_attn.config.prefill = [True]*layers
+#                 model.model.layers[i].self_attn.config.decoding_evict = [None]*layers
+
+#         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+
+#         with open(out_path, "a", encoding="utf-8") as f:
+#             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
+#             f.write('\n')
+
 @torch.inference_mode()
-def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path):
+def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, budget_logger=None):
 
     for json_obj in tqdm(data):
+        # Start sample logging if logger is available
+        if budget_logger:
+            budget_logger.start_sample(json_obj)
+        
         prompt = prompt_format.format(**json_obj)
-        # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
-        tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-
-        if len(tokenized_prompt) > max_length:
-            half = int(max_length/2)
-            prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
-            prompt = build_chat(tokenizer, prompt, model_name)
+        # ... existing prompt processing ...
 
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
 
+        # Set logger in CAKE cache before generation
+        if compress and budget_logger:
+            layers = len(model.model.layers)
+            for i in range(layers):
+                if hasattr(model.model.layers[i].self_attn.config, 'prefill_cake_evict'):
+                    for cache in model.model.layers[i].self_attn.config.prefill_cake_evict:
+                        cache.set_budget_logger(budget_logger)
+
+        # Generate output
         if dataset == "samsum":
             output = model.generate(
                 **input,
@@ -99,8 +155,12 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
                 do_sample=False,
                 temperature=1.0,
             )[0]
-  
 
+        # End sample logging
+        if budget_logger:
+            budget_logger.end_sample()
+
+        # Reset model state
         if compress:
             layers = len(model.model.layers)
             for i in range(layers):
@@ -125,6 +185,7 @@ def seed_everything(seed):
 
 def load_model_and_tokenizer(path, model_name, device, compress_config):
 
+    # Step 1: Apply monkeypatch first
     if compress_config.compress:
         if "llama" in model_name:
             from cake.monkeypatch import replace_flashllama_attn_with_cakeattn
@@ -136,16 +197,21 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
             from cake.monkeypatch import replace_flashqwen2_attn_with_cakeattn
             replace_flashqwen2_attn_with_cakeattn()
 
-    if "qwen2" in model_name:
-        dtype = torch.bfloat16
-    else:
-        dtype = torch.float16
-   
+    # Step 2: Set dtype
+    dtype = torch.bfloat16 if "qwen2" in model_name else torch.float16
+
+    # Step 3: Load tokenizer and model (still on CPU)
     tokenizer = AutoTokenizer.from_pretrained(path)
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=dtype,
+        path,
+        torch_dtype=dtype,
         attn_implementation="flash_attention_2"
-    ).to(device)
+    )
+
+    # Step 4: Move model to GPU *after* monkeypatch
+    model = model.to(device)
+
+    # Step 5: Only now access config/layers
     config = AutoConfig.from_pretrained(path)
     if hasattr(config, 'num_hidden_layers'):
         layers = config.num_hidden_layers
@@ -170,27 +236,31 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
             )]*layers
 
     model = model.eval()
-
-    
     return model, tokenizer
+
 
 if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
+
     pred_name = args.pred_name
     model_name = args.model
+    # Initialize budget logger
+    budget_logger = LongBenchBudgetLogger(
+        save_dir=f"longbench_budget_logs/{args.pred_name}_{args.cache_size}_llama3-1-8b-128k",
+    )
     compress = args.compress
     cascading = args.cascading
     compress_config = CompressConfig(compress, cascading)
-    model2path = json.load(open("config/model2path.json", "r"))
-    model2maxlen = json.load(open("config/model2maxlen.json", "r"))
+    model2path = json.load(open("experiments/LongBench/config/model2path.json", "r"))
+    model2maxlen = json.load(open("experiments/LongBench/config/model2maxlen.json", "r"))
     # define your model
     max_length = model2maxlen[model_name]
     if compress:
         compress_config.cache_size = args.cache_size
         compress_config.window_size = args.window_size
         cache_name = f"cache{args.cache_size}"
-        model2tau = json.load(open("config/model2tau.json", "r"))
+        model2tau = json.load(open("experiments/LongBench/config/model2tau.json", "r"))
         try:
             tau1 = model2tau[model_name][f"{args.cache_size}"]["tau1"]
             tau2 = model2tau[model_name][f"{args.cache_size}"]["tau2"]
@@ -208,31 +278,39 @@ if __name__ == '__main__':
 
     model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device, compress_config)
 
-    datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
-                    "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
-                "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    # datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
+    #                 "gov_report"]
+
+    # datasets = ["qasper_mod"]
                 
+    datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
+                "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+                "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
 
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
-    dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
-    dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
+    dataset2prompt = json.load(open("experiments/LongBench/config/dataset2prompt.json", "r"))
+    dataset2maxlen = json.load(open("experiments/LongBench/config/dataset2maxlen.json", "r"))
     # predict on each dataset
     if not os.path.exists(f"./pred_result/{cache_name}/{pred_name}"):
         os.makedirs(f"./pred_result/{cache_name}/{pred_name}")
     
     for dataset in datasets:
-        #load offline 
+        # Start dataset logging
+        budget_logger.start_dataset(dataset)
+        
+        # Load dataset
         data_files = {"test": f"{dataset}.jsonl"}
         data = load_dataset("json", data_dir='./datasets/longbench/data', split='test', data_files=data_files)
 
         if not os.path.exists(f"./pred_result/{cache_name}/{pred_name}/{model_name}"):
             os.makedirs(f"./pred_result/{cache_name}/{pred_name}/{model_name}")
         out_path = f"./pred_result/{cache_name}/{pred_name}/{model_name}/{dataset}.jsonl"
-    
+
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
 
+        # Handle existing results
         if os.path.exists(out_path):
             with open(out_path, 'r', encoding='utf-8') as file:
                 lines = file.readlines()
@@ -240,7 +318,15 @@ if __name__ == '__main__':
             if len(data_all) == len(lines):
                 continue
             else:
-                data_all=data_all[len(lines):]
+                data_all = data_all[len(lines):]
 
-        get_pred(model, tokenizer, compress, data_all, max_length, \
-                                    max_gen, prompt_format, dataset, model_name, model2path, out_path)
+        # Pass logger to get_pred function
+        get_pred(model, tokenizer, compress, data_all, max_length, 
+                max_gen, prompt_format, dataset, model_name, model2path, out_path, budget_logger)
+        
+        # End dataset logging
+        budget_logger.end_dataset()
+
+    # Save comprehensive report after all datasets
+    final_report = budget_logger.save_comprehensive_report()
+    print(f"[CAKE] Budget allocation analysis complete!")

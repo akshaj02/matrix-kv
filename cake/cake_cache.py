@@ -4,7 +4,7 @@ from torch import nn
 import numpy as np
 from transformers.cache_utils import DynamicCache, Cache, HybridCache
 from typing import Any, Dict, List, Optional, Tuple, Union
-from cake.logger import LongBenchBudgetLogger
+
 from cake.utils import adjust_budgets, compute_head_budgets, compute_head_budgets_dynamic, analyze_budget_distribution, compute_head_budgets_vanilla_cake
 
 class CakeCache(Cache):
@@ -214,12 +214,9 @@ class CakeprefillKVCache:
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.use_cascading = use_cascading  # If true, ensure high attention precision
-        self.budget_logger = None  # Will be set externally
-        self.silent_mode = True    # Suppress prints during evaluation
+
         # print(f"CakeprefillKVCache: {self.total_size}, {self.window_size}")
-    def set_budget_logger(self, logger: LongBenchBudgetLogger):
-        """Set the budget logger for this cache"""
-        self.budget_logger = logger
+
     def __call__(self, past_key_values, seq_len):
         if seq_len<=self.cache_size+self.window_size:
             return past_key_values
@@ -237,19 +234,6 @@ class CakeprefillKVCache:
         #     pref_scores, 
         #     self.total_size
         # )
-
-        # Log allocation for each layer if logger is available
-        if self.budget_logger:
-            for layer_idx in head_budgets:
-                available_tokens = past_key_values.key_cache[layer_idx].shape[2] - self.window_size
-                self.budget_logger.log_layer_allocation(
-                    layer_idx=layer_idx,
-                    head_budgets=head_budgets[layer_idx],
-                    pref_scores=pref_scores[layer_idx],
-                    allocation_strategy="entropy_based",
-                    available_tokens=available_tokens,
-                    window_size=self.window_size
-                )
 
         # Add analysis
         # analyze_budget_distribution(head_budgets, pref_scores)

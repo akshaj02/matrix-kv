@@ -417,14 +417,14 @@ class CakeprefillKVCache:
         B, H, S, D = key_cache.shape
         device = key_cache.device
 
-        # print(f"\n[CAKE] Layer {layer_idx} - Dynamic Budget Testing:")
-        # print("-" * 50)
+        print(f"\n[CAKE] Layer {layer_idx} - Dynamic Budget Testing:")
+        print("-" * 50)
         
         # Analyze budget distribution vs uniform allocation
         uniform_budget = sum(head_budgets) // H
         total_available = S - window_size
         
-        # budget_variance = np.var(head_budgets)
+        budget_variance = np.var(head_budgets)
         budget_efficiency = []
         
         for h in range(H):
@@ -432,24 +432,24 @@ class CakeprefillKVCache:
             available_tokens = total_available
             
             # Calculate utilization metrics
-            # utilization = min(allocated_budget / available_tokens, 1.0) * 100 if available_tokens > 0 else 0
+            utilization = min(allocated_budget / available_tokens, 1.0) * 100 if available_tokens > 0 else 0
             efficiency = allocated_budget / uniform_budget if uniform_budget > 0 else 1.0
             
             budget_efficiency.append(efficiency)
             
-            # print(f"[CAKE] Layer {layer_idx} | Head {h:2d} | "
-            #     f"Budget: {allocated_budget:3d} (vs uniform: {uniform_budget:3d}) | "
-            #     f"Efficiency: {efficiency:5.2f}x | Utilization: {utilization:5.1f}%")
+            print(f"[CAKE] Layer {layer_idx} | Head {h:2d} | "
+                f"Budget: {allocated_budget:3d} (vs uniform: {uniform_budget:3d}) | "
+                f"Efficiency: {efficiency:5.2f}x | Utilization: {utilization:5.1f}%")
         
-        # # Summary statistics
-        # avg_efficiency = np.mean(budget_efficiency)
-        # max_efficiency = np.max(budget_efficiency)
-        # min_efficiency = np.min(budget_efficiency)
+        # Summary statistics
+        avg_efficiency = np.mean(budget_efficiency)
+        max_efficiency = np.max(budget_efficiency)
+        min_efficiency = np.min(budget_efficiency)
         
-        # print(f"[CAKE] Layer {layer_idx} Summary:")
-        # print(f"  Budget Variance: {budget_variance:.2f}")
-        # print(f"  Efficiency Range: [{min_efficiency:.2f}x - {max_efficiency:.2f}x], Avg: {avg_efficiency:.2f}x")
-        # print(f"  Total Budget: {sum(head_budgets)} (Uniform would be: {uniform_budget * H})")
+        print(f"[CAKE] Layer {layer_idx} Summary:")
+        print(f"  Budget Variance: {budget_variance:.2f}")
+        print(f"  Efficiency Range: [{min_efficiency:.2f}x - {max_efficiency:.2f}x], Avg: {avg_efficiency:.2f}x")
+        print(f"  Total Budget: {sum(head_budgets)} (Uniform would be: {uniform_budget * H})")
         
         # FOR TESTING: Keep all tokens, just track budget allocation
         # Later implement actual eviction here

@@ -6,4 +6,5 @@ datasets/
 cake_debug_scores.pkl
 pred_result/
 models/
-longbench_budget_logs
+longbench_budget_logs/
+plot.ipynb

@@ -8,7 +8,8 @@
         "program": "${workspaceFolder}/experiments/LongBench/pred_cake.py",
         "console": "integratedTerminal",
         "env": {
-          "CUDA_VISIBLE_DEVICES": "1"
+          "CUDA_VISIBLE_DEVICES": "1,2",
+          "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"
         },
         "args": [
           "--model", "llama3.1-8b-128k",

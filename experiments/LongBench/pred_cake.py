@@ -99,7 +99,14 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
                 do_sample=False,
                 temperature=1.0,
             )[0]
-  
+         # ADD MEMORY CLEANUP HERE - after generation, before model reset
+        import gc
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # Check for memory leaks
+        print(f"GPU 0 memory: {torch.cuda.memory_allocated(0)/1e9:.2f}GB")
+        print(f"GPU 1 memory: {torch.cuda.memory_allocated(1)/1e9:.2f}GB")
 
         if compress:
             layers = len(model.model.layers)
@@ -143,14 +150,27 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
 
     # Step 3: Load tokenizer and model (still on CPU)
     tokenizer = AutoTokenizer.from_pretrained(path)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     path,
+    #     torch_dtype=dtype,
+    #     attn_implementation="flash_attention_2"
+    # )
+
+    # # Step 4: Move model to GPU *after* monkeypatch
+    # model = model.to(device)
+
+    ##### MULTI GPU SUPPORT #####
+    # Modified code for dual GPU support:
     model = AutoModelForCausalLM.from_pretrained(
         path,
         torch_dtype=dtype,
-        attn_implementation="flash_attention_2"
+        attn_implementation="flash_attention_2",
+        device_map="auto"  # Add this line for automatic GPU distribution
     )
 
-    # Step 4: Move model to GPU *after* monkeypatch
-    model = model.to(device)
+    # Step 4: Remove the manual .to(device) call since device_map handles placement
+    # model = model.to(device)  # Comment out or remove this line
+    print("Model device map:", getattr(model, 'hf_device_map', 'No device map found'))
 
     # Step 5: Only now access config/layers
     config = AutoConfig.from_pretrained(path)
@@ -219,11 +239,11 @@ if __name__ == '__main__':
     # datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
     #                 "gov_report"]
 
-    datasets = ["qasper_mod"]
+    # datasets = ["qasper_mod"]
                 
-    # datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
-    #             "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
-    #             "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    datasets = ["multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
+                "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+                "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
 
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("experiments/LongBench/config/dataset2prompt.json", "r"))
@@ -255,6 +275,5 @@ if __name__ == '__main__':
             else:
                 data_all = data_all[len(lines):]
 
-        # Pass logger to get_pred function
         get_pred(model, tokenizer, compress, data_all, max_length, 
                 max_gen, prompt_format, dataset, model_name, model2path, out_path)

@@ -6,6 +6,23 @@ from transformers.cache_utils import DynamicCache, Cache, HybridCache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from cake.utils import adjust_budgets, compute_head_budgets, compute_head_budgets_dynamic, analyze_budget_distribution, compute_head_budgets_vanilla_cake
+import logging
+from datetime import datetime
+
+def setup_cake_logging():
+    log_filename = f'cake_plus_plus_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    logging.basicConfig(
+        filename=log_filename,
+        filemode='a',
+        format='%(asctime)s - %(message)s',
+        level=logging.INFO
+    )
+    
+    return log_filename
+
+# Add this to your main script
+log_file = setup_cake_logging()
 
 class CakeCache(Cache):
     """
@@ -214,7 +231,7 @@ class CakeprefillKVCache:
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.use_cascading = use_cascading  # If true, ensure high attention precision
-
+        # Although the cascading came with CAKE, I have not used it here. 
         # print(f"CakeprefillKVCache: {self.total_size}, {self.window_size}")
 
     def __call__(self, past_key_values, seq_len):
@@ -229,15 +246,6 @@ class CakeprefillKVCache:
             allocation_strategy="entropy_based"  # or get from config
         )
 
-        # vanila CAKE
-        # head_budgets = compute_head_budgets_vanilla_cake(
-        #     pref_scores, 
-        #     self.total_size
-        # )
-
-        # Add analysis
-        # analyze_budget_distribution(head_budgets, pref_scores)
-        #print total budget
 
         for layer_idx in head_budgets:
             past_key_values = self.evict_kvcache_headwise(
@@ -276,7 +284,12 @@ class CakeprefillKVCache:
 
         return past_key_values
 
+
+    
     def evcit_layer_kvcache(self, past_key_values, layer_idx, budget):
+        """
+        Vanilla CAKE eviction
+        """
 
         bsz, num_key_value_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
 
@@ -304,95 +317,12 @@ class CakeprefillKVCache:
 
         return past_key_values
 
-    # def evict_kvcache_headwise(self, past_key_values, layer_idx, head_budgets, window_size):
-    #     """
-    #     Evict tokens per head based on head-specific scores, then pad heads to same length for FlashAttention.
-
-    #     Args:
-    #         past_key_values: CakeCache object
-    #         layer_idx: which layer to compress
-    #         head_budgets: list of ints [H] specifying how many tokens to keep per head
-    #         window_size: number of recent tokens to always keep
-    #     """
-    #     key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
-    #     value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
-    #     hh_score = past_key_values.evict_scores[layer_idx]    # [B, H, S]
-
-    #     B, H, S, D = key_cache.shape
-    #     device = key_cache.device
-
-    #     k_out = []
-    #     v_out = []
-    #     max_len = 0
-
-    #     for h in range(H):
-    #         # Scores excluding the recent window
-    #         scores = hh_score[:, h, :-window_size]  # [B, L - window]
-    #         # available_len = scores.shape[-1]
-
-    #         # k = min(head_budgets[h], available_len)
-    #         # if k <= 0:
-    #         #     topk_idx = torch.empty((B, 0), dtype=torch.long, device=device)
-    #         # else:
-    #         #     topk_idx = scores.topk(k, dim=-1).indices  # [B, k]
-
-    #         available_len = scores.shape[-1]
-    #         print(f"[CAKE] Layer {layer_idx} | Head {h:2d} | Available tokens: {available_len} | Budget: {head_budgets[h]}")
-    #         k = min(max(0, head_budgets[h]), available_len)  # ensure at least 1, but not more than available
-    #         ## I observe that sometimes the budget allocation is 0 but we still keep atleast one token thanks to above line
-    #         topk_idx = scores.topk(k, dim=-1).indices  # [B, k]
-
-
-    #         # Expand index for gathering: [B, k, D]
-    #         gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, D)
-
-    #         # torch.select 
-
-    #         # Gather key/value
-    #         k_selected = key_cache[:, h, :-window_size, :].gather(1, gather_idx)  # [B, k, D]
-    #         v_selected = value_cache[:, h, :-window_size, :].gather(1, gather_idx)
-
-    #         # Append the most recent window
-    #         k_window = key_cache[:, h, -window_size:, :]  # [B, window, D]
-    #         v_window = value_cache[:, h, -window_size:, :]
-
-    #         k_final = torch.cat([k_selected, k_window], dim=1)  # [B, k + window, D]
-    #         v_final = torch.cat([v_selected, v_window], dim=1)
-
-    #         max_len = max(max_len, k_final.shape[1])
-    #         k_out.append(k_final)
-    #         v_out.append(v_final)
-
-    #         retained_len = k_final.shape[1]
-    #         print(f"[CAKE] Layer {layer_idx} | Head {h:2d} retained tokens: {retained_len}")
-
-
-    #     # Pad all heads to max_len for FlashAttention
-    #     k_padded = []
-    #     v_padded = []
-
-    #     for h in range(H):
-    #         k = k_out[h]
-    #         v = v_out[h]
-    #         pad_len = max_len - k.shape[1]
-
-    #         if pad_len > 0:
-    #             pad_k = torch.zeros(B, pad_len, D, device=device, dtype=k.dtype)
-    #             pad_v = torch.zeros(B, pad_len, D, device=device, dtype=v.dtype)
-    #             k = torch.cat([k, pad_k], dim=1)
-    #             v = torch.cat([v, pad_v], dim=1)
-
-    #         k_padded.append(k.unsqueeze(1))  # [B, 1, max_len, D]
-    #         v_padded.append(v.unsqueeze(1))
-
-    #     # Stack across heads
-    #     past_key_values.key_cache[layer_idx] = torch.cat(k_padded, dim=1)  # [B, H, max_len, D]
-    #     past_key_values.value_cache[layer_idx] = torch.cat(v_padded, dim=1)
-
-    #     return past_key_values
     def evict_kvcache_headwise(self, past_key_values, layer_idx, head_budgets, window_size):
         """
-        Dynamic budget allocation per head - TESTING MODE (no actual eviction yet)
+        Dynamic budget allocation per head with detailed logging
+
+        ** Note: Tried to implement the logger, but it adds too much information which is redundant. 
+        Didn't feel like removing it but doesn't affect the functionality.
         """
         key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
         value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
@@ -401,10 +331,11 @@ class CakeprefillKVCache:
         B, H, S, D = key_cache.shape
         device = key_cache.device
 
-        print(f"\n[CAKE] Layer {layer_idx} - Dynamic Budget Testing:")
-        print("-" * 50)
+        # Log detailed analysis
+        logging.info(f"Layer {layer_idx} - Head-wise Budget Analysis:")
+        logging.info("-" * 50)
         
-        # Analyze budget distribution vs uniform allocation
+        # Analyze budget distribution vs uniform allocation (i think this is incorrect calcuation)
         uniform_budget = sum(head_budgets) // H
         total_available = S - window_size
         
@@ -421,22 +352,21 @@ class CakeprefillKVCache:
             
             budget_efficiency.append(efficiency)
             
-            print(f"[CAKE] Layer {layer_idx} | Head {h:2d} | "
-                f"Budget: {allocated_budget:3d} (vs uniform: {uniform_budget:3d}) | "
-                f"Efficiency: {efficiency:5.2f}x | Utilization: {utilization:5.1f}%")
-        
+            logging.info(f"Head {h:2d}: Budget={allocated_budget:3d} (vs uniform: {uniform_budget:3d}), "
+                        f"Efficiency={efficiency:5.2f}x, Utilization={utilization:5.1f}%")
+        # useless logging why did I do this
         # Summary statistics
         avg_efficiency = np.mean(budget_efficiency)
         max_efficiency = np.max(budget_efficiency)
         min_efficiency = np.min(budget_efficiency)
         
-        print(f"[CAKE] Layer {layer_idx} Summary:")
-        print(f"  Budget Variance: {budget_variance:.2f}")
-        print(f"  Efficiency Range: [{min_efficiency:.2f}x - {max_efficiency:.2f}x], Avg: {avg_efficiency:.2f}x")
-        print(f"  Total Budget: {sum(head_budgets)} (Uniform would be: {uniform_budget * H})")
+        logging.info(f"Layer {layer_idx} Summary:")
+        logging.info(f"  Budget Variance: {budget_variance:.2f}")
+        logging.info(f"  Efficiency Range: [{min_efficiency:.2f}x - {max_efficiency:.2f}x], Avg: {avg_efficiency:.2f}x")
+        logging.info(f"  Total Budget: {sum(head_budgets)} (Uniform would be: {uniform_budget * H})")
+        logging.info("")
         
-        # FOR TESTING: Keep all tokens, just track budget allocation
-        # Later implement actual eviction here
+        # TODO: Real eviction logic lol 
         
         return past_key_values
 

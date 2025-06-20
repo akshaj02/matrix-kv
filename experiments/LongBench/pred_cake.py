@@ -65,7 +65,7 @@ def build_chat(tokenizer, prompt, model_name):
 
 
 @torch.inference_mode()
-def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path):
+def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, compress_config):
 
     for json_obj in tqdm(data):
         prompt = prompt_format.format(**json_obj)
@@ -80,7 +80,11 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
 
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
-
+        
+        if compress and hasattr(tokenizer, "compress_config") and tokenizer.compress_config.head_budgets is not None:
+            # propagate to all layers
+            for i in range(len(model.model.layers)):
+                model.model.layers[i].self_attn.config.head_budgets = tokenizer.compress_config.head_budgets
         if dataset == "samsum":
             output = model.generate(
                 **input,
@@ -103,10 +107,6 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
         import gc
         torch.cuda.empty_cache()
         gc.collect()
-        
-        # Check for memory leaks
-        print(f"GPU 0 memory: {torch.cuda.memory_allocated(0)/1e9:.2f}GB")
-        print(f"GPU 1 memory: {torch.cuda.memory_allocated(1)/1e9:.2f}GB")
 
         if compress:
             layers = len(model.model.layers)
@@ -131,6 +131,78 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
+# def load_model_and_tokenizer(path, model_name, device, compress_config):
+
+#     # Step 1: Apply monkeypatch first
+#     if compress_config.compress:
+#         if "llama" in model_name:
+#             from cake.monkeypatch import replace_flashllama_attn_with_cakeattn
+#             replace_flashllama_attn_with_cakeattn()
+#         elif "mistral" in model_name:
+#             from cake.monkeypatch import replace_flashmistral_attn_with_cakeattn
+#             replace_flashmistral_attn_with_cakeattn()
+#         elif "qwen2" in model_name:
+#             from cake.monkeypatch import replace_flashqwen2_attn_with_cakeattn
+#             replace_flashqwen2_attn_with_cakeattn()
+
+#     # Step 2: Set dtype
+#     dtype = torch.bfloat16 if "qwen2" in model_name else torch.float16
+
+#     # Step 3: Load tokenizer and model (still on CPU)
+#     tokenizer = AutoTokenizer.from_pretrained(path)
+#     # model = AutoModelForCausalLM.from_pretrained(
+#     #     path,
+#     #     torch_dtype=dtype,
+#     #     attn_implementation="flash_attention_2"
+#     # )
+
+#     # # Step 4: Move model to GPU *after* monkeypatch
+#     # model = model.to(device)
+
+#     ##### MULTI GPU SUPPORT #####
+#     # Modified code for dual GPU support:
+#     model = AutoModelForCausalLM.from_pretrained(
+#         path,
+#         torch_dtype=dtype,
+#         attn_implementation="flash_attention_2",
+#         device_map="auto"  # Add this line for automatic GPU distribution
+#     )
+
+#     # Step 4: Remove the manual .to(device) call since device_map handles placement
+#     # model = model.to(device)  # Comment out or remove this line
+#     print("Model device map:", getattr(model, 'hf_device_map', 'No device map found'))
+
+#     # Step 5: Only now access config/layers
+#     config = AutoConfig.from_pretrained(path)
+#     if hasattr(config, 'num_hidden_layers'):
+#         layers = config.num_hidden_layers
+
+#     if compress_config.compress:
+#         model.config.head_budgets = None
+#         for i in range(layers):
+#             model.model.layers[i].self_attn.config.key_size = [compress_config.cache_size - compress_config.window_size]*layers
+#             model.model.layers[i].self_attn.config.window_size = [compress_config.window_size]*layers
+#             model.model.layers[i].self_attn.config.prefill = [True]*layers
+#             model.model.layers[i].self_attn.config.decoding_evict = [None]*layers
+#             model.model.layers[i].self_attn.config.tau1 = compress_config.hyper[0]
+#             model.model.layers[i].self_attn.config.tau2 = compress_config.hyper[1] 
+#             model.model.layers[i].self_attn.config.gamma = compress_config.hyper[2] 
+#             model.model.layers[i].self_attn.config = model.config
+#             model.model.layers[i].self_attn.config.prefill_cake_evict = [CakeprefillKVCache(
+#                 cache_size=compress_config.cache_size,
+#                 window_size=compress_config.window_size,
+#                 k_seq_dim=2,
+#                 v_seq_dim=2,
+#                 num_heads=model.model.layers[i].self_attn.num_heads,
+#                 num_layers=layers,
+#                 use_cascading=compress_config.cascading, 
+#                 config=compress_config,
+#                 model_layers=model.model.layers
+#             )]*layers
+
+#     model = model.eval()
+#     return model, tokenizer
+
 def load_model_and_tokenizer(path, model_name, device, compress_config):
 
     # Step 1: Apply monkeypatch first
@@ -148,53 +220,52 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
     # Step 2: Set dtype
     dtype = torch.bfloat16 if "qwen2" in model_name else torch.float16
 
-    # Step 3: Load tokenizer and model (still on CPU)
+    # Step 3: Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(path)
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     path,
-    #     torch_dtype=dtype,
-    #     attn_implementation="flash_attention_2"
-    # )
-
-    # # Step 4: Move model to GPU *after* monkeypatch
-    # model = model.to(device)
-
-    ##### MULTI GPU SUPPORT #####
-    # Modified code for dual GPU support:
     model = AutoModelForCausalLM.from_pretrained(
         path,
         torch_dtype=dtype,
         attn_implementation="flash_attention_2",
-        device_map="auto"  # Add this line for automatic GPU distribution
+        device_map="auto"
     )
 
-    # Step 4: Remove the manual .to(device) call since device_map handles placement
-    # model = model.to(device)  # Comment out or remove this line
     print("Model device map:", getattr(model, 'hf_device_map', 'No device map found'))
 
-    # Step 5: Only now access config/layers
-    config = AutoConfig.from_pretrained(path)
-    if hasattr(config, 'num_hidden_layers'):
-        layers = config.num_hidden_layers
+    # Step 4: Get layers count
+    if hasattr(model.config, 'num_hidden_layers'):
+        layers = model.config.num_hidden_layers
 
     if compress_config.compress:
+        # Add head_budgets attribute to the main config
+        model.config.head_budgets = None
+        
+        # Create a single prefill cache instance
+        prefill_cache = CakeprefillKVCache(
+            cache_size=compress_config.cache_size,
+            window_size=compress_config.window_size,
+            k_seq_dim=2,
+            v_seq_dim=2,
+            num_heads=model.model.layers[0].self_attn.num_heads,
+            num_layers=layers,
+            use_cascading=compress_config.cascading, 
+            config=compress_config,
+            model_layers=model.model.layers
+        )
+        
+        # Set layer-specific attributes
         for i in range(layers):
-            model.model.layers[i].self_attn.config.key_size = [compress_config.cache_size - compress_config.window_size]*layers
-            model.model.layers[i].self_attn.config.window_size = [compress_config.window_size]*layers
-            model.model.layers[i].self_attn.config.prefill = [True]*layers
-            model.model.layers[i].self_attn.config.decoding_evict = [None]*layers
-            model.model.layers[i].self_attn.config.tau1 = compress_config.hyper[0]
-            model.model.layers[i].self_attn.config.tau2 = compress_config.hyper[1] 
-            model.model.layers[i].self_attn.config.gamma = compress_config.hyper[2] 
-            model.model.layers[i].self_attn.config.prefill_cake_evict = [CakeprefillKVCache(
-                cache_size=compress_config.cache_size,
-                window_size=compress_config.window_size,
-                k_seq_dim=2,
-                v_seq_dim=2,
-                num_heads=model.model.layers[i].self_attn.num_heads,
-                num_layers=layers,
-                use_cascading=compress_config.cascading
-            )]*layers
+            # Make each layer's self_attn reference the main config
+            model.model.layers[i].self_attn.config = model.config
+            
+        # Add other attributes to the main config (not per-layer)
+        model.config.key_size = [compress_config.cache_size - compress_config.window_size] * layers
+        model.config.window_size = [compress_config.window_size] * layers
+        model.config.prefill = [True] * layers
+        model.config.decoding_evict = [None] * layers
+        model.config.tau1 = compress_config.hyper[0]
+        model.config.tau2 = compress_config.hyper[1] 
+        model.config.gamma = compress_config.hyper[2]
+        model.config.prefill_cake_evict = [prefill_cache] * layers
 
     model = model.eval()
     return model, tokenizer
@@ -212,6 +283,7 @@ if __name__ == '__main__':
     compress_config = CompressConfig(compress, cascading)
     model2path = json.load(open("experiments/LongBench/config/model2path.json", "r"))
     model2maxlen = json.load(open("experiments/LongBench/config/model2maxlen.json", "r"))
+    compress_config.head_budgets = None
     # define your model
     max_length = model2maxlen[model_name]
     if compress:
@@ -237,11 +309,11 @@ if __name__ == '__main__':
     model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device, compress_config)
 
     # datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
-    #                 "gov_report"]
+    #                 "gov_report", ]
 
     # datasets = ["qasper_mod"]
                 
-    datasets = ["multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
+    datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
                 "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
                 "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
 
@@ -276,4 +348,4 @@ if __name__ == '__main__':
                 data_all = data_all[len(lines):]
 
         get_pred(model, tokenizer, compress, data_all, max_length, 
-                max_gen, prompt_format, dataset, model_name, model2path, out_path)
+                max_gen, prompt_format, dataset, model_name, model2path, out_path, compress_config)

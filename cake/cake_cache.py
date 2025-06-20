@@ -5,24 +5,9 @@ import numpy as np
 from transformers.cache_utils import DynamicCache, Cache, HybridCache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from cake.utils import adjust_budgets, compute_head_budgets, compute_head_budgets_dynamic, analyze_budget_distribution, compute_head_budgets_vanilla_cake
-import logging
+from cake.utils import adjust_budgets, compute_head_budgets, compute_head_budgets_dynamic
 from datetime import datetime
 
-def setup_cake_logging():
-    log_filename = f'cake_plus_plus_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    
-    logging.basicConfig(
-        filename=log_filename,
-        filemode='a',
-        format='%(asctime)s - %(message)s',
-        level=logging.INFO
-    )
-    
-    return log_filename
-
-# Add this to your main script
-log_file = setup_cake_logging()
 
 class CakeCache(Cache):
     """
@@ -220,7 +205,9 @@ class CakeprefillKVCache:
         v_seq_dim=2,
         num_heads = 32, 
         num_layers = 32,
-        use_cascading = False
+        use_cascading = False,
+        config=None,
+        model_layers=None
     ):
 
         self.window_size = window_size
@@ -232,6 +219,8 @@ class CakeprefillKVCache:
         self.num_layers = num_layers
         self.use_cascading = use_cascading  # If true, ensure high attention precision
         # Although the cascading came with CAKE, I have not used it here. 
+        self.config = config
+        self.model_layers = model_layers
         # print(f"CakeprefillKVCache: {self.total_size}, {self.window_size}")
 
     def __call__(self, past_key_values, seq_len):
@@ -243,10 +232,12 @@ class CakeprefillKVCache:
         head_budgets = compute_head_budgets_dynamic(
             pref_scores, 
             self.total_size,
-            allocation_strategy="entropy_based"  # or get from config
+            allocation_strategy="entropy_based",
+            max_seq_len=seq_len  # or get from config
         )
-
-
+        # Store head budgets in the CakeCache object
+        past_key_values.head_budgets = head_budgets
+        # print(f"[CAKE] Stored head_budgets in past_key_values: {head_budgets}")
         for layer_idx in head_budgets:
             past_key_values = self.evict_kvcache_headwise(
                 past_key_values,
@@ -330,10 +321,6 @@ class CakeprefillKVCache:
 
         B, H, S, D = key_cache.shape
         device = key_cache.device
-
-        # Log detailed analysis
-        logging.info(f"Layer {layer_idx} - Head-wise Budget Analysis:")
-        logging.info("-" * 50)
         
         # Analyze budget distribution vs uniform allocation (i think this is incorrect calcuation)
         uniform_budget = sum(head_budgets) // H
@@ -352,19 +339,13 @@ class CakeprefillKVCache:
             
             budget_efficiency.append(efficiency)
             
-            logging.info(f"Head {h:2d}: Budget={allocated_budget:3d} (vs uniform: {uniform_budget:3d}), "
-                        f"Efficiency={efficiency:5.2f}x, Utilization={utilization:5.1f}%")
+            
         # useless logging why did I do this
         # Summary statistics
         avg_efficiency = np.mean(budget_efficiency)
         max_efficiency = np.max(budget_efficiency)
         min_efficiency = np.min(budget_efficiency)
-        
-        logging.info(f"Layer {layer_idx} Summary:")
-        logging.info(f"  Budget Variance: {budget_variance:.2f}")
-        logging.info(f"  Efficiency Range: [{min_efficiency:.2f}x - {max_efficiency:.2f}x], Avg: {avg_efficiency:.2f}x")
-        logging.info(f"  Total Budget: {sum(head_budgets)} (Uniform would be: {uniform_budget * H})")
-        logging.info("")
+
         
         # TODO: Real eviction logic lol 
         

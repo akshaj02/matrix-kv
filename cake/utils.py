@@ -11,6 +11,7 @@ class CompressConfig:
         self.window_size = window_size
         self.hyper = hyper
         self.allocation_strategy = allocation_strategy  # NEW
+        self.head_budgets = None 
     
     def __str__(self):
         return f"Config(cache_size={self.cache_size}, window_size={self.window_size}, " \
@@ -106,7 +107,65 @@ def compute_head_budgets(pref_scores: List[torch.Tensor], total_budget: int) -> 
 
     return out
 
-def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: int, allocation_strategy: str = "entropy_based"):
+# def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: int, allocation_strategy: str = "entropy_based"):
+#     """
+#     Dynamic budget allocation with Multi-GPU Support
+#     """
+#     if not pref_scores:
+#         return {}
+    
+#     # Multi-GPU device alignment
+#     device_aligned_scores = []
+#     target_device = pref_scores[0].device
+    
+#     for scores in pref_scores:
+#         if scores.device != target_device:
+#             scores = scores.to(target_device)
+#         device_aligned_scores.append(scores)
+    
+#     if allocation_strategy == "entropy_based":
+#         # Use device-aligned scores for computation
+#         flat_scores = torch.cat(device_aligned_scores)  # shape: [L * H]
+        
+#         # Normalize scores to get allocation weights
+#         allocation_weights = flat_scores / flat_scores.sum()
+#         raw_budgets = (allocation_weights * total_budget).long()
+        
+#         # Ensure minimum budget per head
+#         min_budget_per_head = 1
+#         total_heads = len(flat_scores)
+#         min_total = min_budget_per_head * total_heads
+        
+#         if total_budget < min_total:
+#             raw_budgets = torch.full_like(raw_budgets, min_budget_per_head)
+#         else:
+#             raw_budgets = torch.clamp(raw_budgets, min=min_budget_per_head)
+#             # Adjust to meet total budget constraint
+#             current_total = raw_budgets.sum()
+#             if current_total != total_budget:
+#                 diff = total_budget - current_total
+#                 if diff > 0:
+#                     _, top_indices = torch.topk(flat_scores, min(abs(diff), len(flat_scores)))
+#                     raw_budgets[top_indices[:diff]] += 1
+#                 else:
+#                     _, bottom_indices = torch.topk(flat_scores, min(abs(diff), len(flat_scores)), largest=False)
+#                     for i in range(abs(diff)):
+#                         if raw_budgets[bottom_indices[i]] > min_budget_per_head:
+#                             raw_budgets[bottom_indices[i]] -= 1
+    
+#     # Convert back to per-layer format
+#     out = {}
+#     offset = 0
+#     for layer_idx, layer_score in enumerate(device_aligned_scores):
+#         H = layer_score.shape[0]
+#         layer_budgets = raw_budgets[offset:offset+H].cpu().tolist()  # Move to CPU for storage
+#         out[layer_idx] = layer_budgets
+#         offset += H
+    
+   
+#     return out
+
+def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: int, allocation_strategy: str = "entropy_based", max_seq_len: int = None):
     """
     Dynamic budget allocation with Multi-GPU Support
     """
@@ -139,13 +198,23 @@ def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: 
             raw_budgets = torch.full_like(raw_budgets, min_budget_per_head)
         else:
             raw_budgets = torch.clamp(raw_budgets, min=min_budget_per_head)
-            # Adjust to meet total budget constraint
+            
+            # SEQUENCE LENGTH AWARENESS: Clamp budgets to max_seq_len if provided
+            if max_seq_len is not None:
+                raw_budgets = torch.clamp(raw_budgets, max=max_seq_len)
+            
+            # Adjust to meet total budget constraint after clamping
             current_total = raw_budgets.sum()
             if current_total != total_budget:
                 diff = total_budget - current_total
                 if diff > 0:
-                    _, top_indices = torch.topk(flat_scores, min(abs(diff), len(flat_scores)))
-                    raw_budgets[top_indices[:diff]] += 1
+                    # Only add to heads that aren't at max_seq_len limit
+                    available_mask = raw_budgets < (max_seq_len if max_seq_len is not None else float('inf'))
+                    if available_mask.any():
+                        available_indices = torch.where(available_mask)[0]
+                        _, top_indices = torch.topk(flat_scores[available_indices], min(abs(diff), len(available_indices)))
+                        actual_indices = available_indices[top_indices[:diff]]
+                        raw_budgets[actual_indices] += 1
                 else:
                     _, bottom_indices = torch.topk(flat_scores, min(abs(diff), len(flat_scores)), largest=False)
                     for i in range(abs(diff)):
@@ -161,5 +230,4 @@ def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: 
         out[layer_idx] = layer_budgets
         offset += H
     
-   
     return out

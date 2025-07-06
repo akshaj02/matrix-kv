@@ -180,6 +180,77 @@ def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: 
         if scores.device != target_device:
             scores = scores.to(target_device)
         device_aligned_scores.append(scores)
+
+    if allocation_strategy == "static":
+        # open the file ./importance_scores/meta_llama_Meta_Llama_3.1_8B_Instruct_importance.npy and read the data
+        importance_scores = np.load("./importance_scores/meta_llama_Meta_Llama_3.1_8B_Instruct_importance.npy")
+
+        # convert to torch tensor
+        importance_scores = torch.from_numpy(importance_scores)
+        # make all the importance scores the same value to essentially remove any ratios 
+        # importance_scores = np.full(importance_scores.shape, 1.0)  # Set all scores to 1.0
+    
+        # Get dimensions
+        num_layers, num_heads = importance_scores.shape
+        # flatten the scores
+        flat_importance = importance_scores.flatten()  # shape: [L * H]
+
+        min_importance = flat_importance.min()
+        total_heads = len(flat_importance)
+        
+        allocation_weights = flat_importance / flat_importance.sum()
+        min_weight = min_importance / flat_importance.sum()
+        # almost always it will be more than 1
+        min_budget_per_head = max(1, int(min_weight * total_budget))
+
+        raw_budgets = (allocation_weights * total_budget).long()  # shape: [L * H]
+        min_total = min_budget_per_head * total_heads
+
+        if total_budget < min_total:
+            # If total budget is too small, scale down proportionally
+            scale_factor = total_budget / min_total
+            raw_budgets = (flat_importance / flat_importance.sum() * total_budget * scale_factor).long()
+            raw_budgets = torch.maximum(raw_budgets, torch.tensor(1, device=raw_budgets.device))
+        else:
+            raw_budgets = torch.maximum(raw_budgets, torch.tensor(min_budget_per_head, device=raw_budgets.device))
+            
+            # SEQUENCE LENGTH AWARENESS: Clamp budgets to max_seq_len if provided
+            if max_seq_len is not None:
+                raw_budgets = torch.minimum(raw_budgets, torch.tensor(max_seq_len, device=raw_budgets.device))
+            
+            # Adjust to meet total budget constraint after clamping
+            current_total = raw_budgets.sum()
+            budget_diff = total_budget - current_total
+            
+            if budget_diff != 0:
+                # Sort by importance for redistribution
+                importance_order = torch.argsort(flat_importance)
+                
+                if budget_diff > 0:
+                    # Add extra budget to most important heads that aren't at max limit
+                    max_limit = max_seq_len if max_seq_len is not None else float('inf')
+                    available_mask = raw_budgets < max_limit
+                    available_indices = torch.where(available_mask)[0]
+                    
+                    if len(available_indices) > 0:
+                        # Sort available indices by importance (descending)
+                        # Sort available indices by importance (descending)
+                        available_importance = flat_importance[available_indices]
+                        sorted_indices = torch.argsort(available_importance, descending=True)
+                        available_by_importance = available_indices[sorted_indices]
+                                    
+                        # Distribute extra budget
+                        for i in range(min(budget_diff, len(available_by_importance))):
+                            raw_budgets[available_by_importance[i]] += 1
+                            
+                else:  # budget_diff < 0
+                    # Remove budget from least important heads, but respect the dynamic minimum
+                    for i in range(min(abs(budget_diff), total_heads)):
+                        head_idx = importance_order[i]
+                        if raw_budgets[head_idx] > min_budget_per_head:
+                            raw_budgets[head_idx] -= 1
+    
+
     
     if allocation_strategy == "entropy_based":
         # Use device-aligned scores for computation

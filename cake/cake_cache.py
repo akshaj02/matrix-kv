@@ -232,7 +232,8 @@ class CakeprefillKVCache:
         head_budgets = compute_head_budgets_dynamic(
             pref_scores, 
             self.total_size,
-            allocation_strategy="entropy_based",
+            # allocation_strategy="entropy_based",
+            allocation_strategy="static",
             max_seq_len=seq_len  # or get from config
         )
         # Store head budgets in the CakeCache object

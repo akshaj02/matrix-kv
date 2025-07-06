@@ -226,7 +226,7 @@ class CakeprefillKVCache:
     def __call__(self, past_key_values, seq_len):
         if seq_len<=self.cache_size+self.window_size:
             return past_key_values
-
+    
         pref_scores = past_key_values.pref_scores
         # print(f"[CAKE] Pref Scores: {pref_scores}")
         head_budgets = compute_head_budgets_dynamic(
@@ -238,15 +238,16 @@ class CakeprefillKVCache:
         )
         # Store head budgets in the CakeCache object
         past_key_values.head_budgets = head_budgets
+        # print(f"[CAKE] Head Budgets: {past_key_values.head_budgets}")
         # print(f"[CAKE] Stored head_budgets in past_key_values: {head_budgets}")
-        for layer_idx in head_budgets:
-            past_key_values = self.evict_kvcache_headwise(
-                past_key_values,
-                layer_idx,
-                head_budgets[layer_idx],
-                self.window_size
-            )
-            past_key_values.layer_budget[layer_idx] = sum(head_budgets[layer_idx])
+        # for layer_idx in head_budgets:
+        #     past_key_values = self.evict_kvcache_headwise(
+        #         past_key_values,
+        #         layer_idx,
+        #         head_budgets[layer_idx],
+        #         self.window_size
+        #     )
+            # past_key_values.layer_budget[layer_idx] = sum(head_budgets[layer_idx])
 
         # head_budgets = compute_head_budgets(evict_scores, total_budget=self.total_size, window_size=self.window_size)
 
@@ -318,41 +319,76 @@ class CakeprefillKVCache:
         """
         key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
         value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
-        hh_score = past_key_values.evict_scores[layer_idx]    # [B, H, S]
 
+        print(layer_idx)
         B, H, S, D = key_cache.shape
         device = key_cache.device
-        
-        # Analyze budget distribution vs uniform allocation (i think this is incorrect calcuation)
-        uniform_budget = sum(head_budgets) // H
-        total_available = S - window_size
-        
-        budget_variance = np.var(head_budgets)
-        budget_efficiency = []
-        
-        for h in range(H):
-            allocated_budget = head_budgets[h]
-            available_tokens = total_available
-            
-            # Calculate utilization metrics
-            utilization = min(allocated_budget / available_tokens, 1.0) * 100 if available_tokens > 0 else 0
-            efficiency = allocated_budget / uniform_budget if uniform_budget > 0 else 1.0
-            
-            budget_efficiency.append(efficiency)
-            
-            
-        # useless logging why did I do this
-        # Summary statistics
-        avg_efficiency = np.mean(budget_efficiency)
-        max_efficiency = np.max(budget_efficiency)
-        min_efficiency = np.min(budget_efficiency)
+        print("NUM HEADS IN CACHE: ", H)
 
-        
-        # TODO: Real eviction logic lol 
+        if len(head_budgets) == 32 and H == 8:
+            kv_head_budgets = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
+        else:
+            kv_head_budgets = head_budgets
+
+        new_key_cache = []
+        new_value_cache = []
+        for h in range(H):
+            # Get the budget for the current head
+            k = kv_head_budgets[h]
+            print(f"[CAKE] Allocated budget for head {h}: {k}")
+            # Get the key and value states for the current head
+            k = max(k, window_size)  # Ensure at least the window size is kept
+            # keep the last k tokens for the current head
+            kept_indices = torch.arange(S - k, S, device=device)
+            new_key_cache.append(key_cache[0, h, kept_indices, :])
+            new_value_cache.append(value_cache[0, h, kept_indices, :])
+
+            past_key_values.key_cache[layer_idx] = [k for k in new_key_cache]
+            past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
         
         return past_key_values
 
+class MatrixDecodingKVCache:
+    def __init__(self, head_budgets, window_size=32, k_seq_dim=2, v_seq_dim=2):
+        self.head_budgets = head_budgets
+        self.window_size = window_size
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
 
+    def __call__(self, head_budgets, past_key_values, layer_idx):
+        """
+        Evict tokens from the cache for each head in the given layer according to head_budgets.
+
+        past_key_values: object with .key_cache and .value_cache, each [B, H, S, D]
+        layer_idx: int, current layer
+        """
+        key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
+        value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
+        B, H, S, D = key_cache.shape
+        device = key_cache.device
+
+        if len(head_budgets) == 32 and H == 8:
+            kv_head_budgets = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
+        else:
+            kv_head_budgets = head_budgets
+        # Support dict or int for window_size
+        # window = self.window_size[layer_idx] if isinstance(self.window_size, dict) else self.window_size
+
+        new_key_cache = []
+        new_value_cache = []
+        for h in range(H):
+            k = kv_head_budgets[h]
+            k = max(k, self.window_size)  # Always keep at least the window
+            # Keep the last k tokens for this head
+            kept_indices = torch.arange(S - k, S, device=device)
+            # [B, S, D] for this head
+            new_key_cache.append(key_cache[:, h, kept_indices, :])
+            new_value_cache.append(value_cache[:, h, kept_indices, :])
+        # Stack back: [B, H, k, D]
+        past_key_values.key_cache[layer_idx] = [k for k in new_key_cache]
+        past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
+        return past_key_values
+        
     
 class CakeDecodingKVCache_LayerWise:
     def __init__(

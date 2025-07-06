@@ -15,3 +15,4 @@ cake/model/modify_qwen2.py
 experiments/LongBench/eval.py
 experiments/LongBench/metrics.py
 experiments/LongBench/pred_cake.py
+experiments/LongBench/test.py

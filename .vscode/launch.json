@@ -15,7 +15,7 @@
           "--model", "llama3.1-8b-128k",
           "--compress",
           "--cascading",
-          "--pred_name", "CAKE_PP_pred_result",
+          "--pred_name", "CAKE_TESTING_pred_result",
           "--device", "0",
           "--cache_size", "1024",
           "--window_size", "32"

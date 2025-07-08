@@ -51,7 +51,7 @@ def llama_attn_forward_cake(
         #         k_seq_dim=2,
         #         v_seq_dim=2
         #         )
-
+        # here for decoration not being used rn 
         self.config.decoding_evict[self.layer_idx] = MatrixDecodingKVCache(
             head_budgets=past_key_value.head_budgets[self.layer_idx],
             window_size=self.config.window_size[self.layer_idx],
@@ -65,16 +65,16 @@ def llama_attn_forward_cake(
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     
     # # Flash attention requires the input to have the shape
     # # batch_size x seq_length x head_dim x hidden_dim
     # # therefore we just need to keep the original shape
-    # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
     if position_embeddings is None:
         logger.warning_once(
@@ -93,9 +93,12 @@ def llama_attn_forward_cake(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
-    dropout_rate = 0.0 if not self.training else self.attention_dropout
+
+    # query_states = query_states.transpose(1, 2)
+    # key_states = key_states.transpose(1, 2)
+    # value_states = value_states.transpose(1, 2)
+
+    dropout_rate = self.attention_dropout if self.training else 0.0
 
 
     is_prefill = q_len != 1
@@ -106,6 +109,9 @@ def llama_attn_forward_cake(
 
 
     if self.config.prefill[self.layer_idx]:
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
         tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
         # # Retrieve the per-head budgets for this layer
@@ -182,14 +188,13 @@ def llama_attn_forward_cake(
         past_key_value = self.config.prefill_cake_evict[self.layer_idx](past_key_value, q_len)
 
         # I am putting the regular flash attention inside of the prefill condition because during decoding we will use the AdaKV style flash attention varlen
-
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-        # to be able to avoid many of these transpose/reshape/view.
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # to be able to avoid many of these transpose/reshape/view.
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
         # therefore the input hidden states gets silently casted in float32. Hence, we need
@@ -217,6 +222,10 @@ def llama_attn_forward_cake(
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
+        # cache contents
+        print(f"[MATRIX] Layer {self.layer_idx} | Key Cache contents: {past_key_value.key_cache[self.layer_idx]}")
+        print(f"[MATRIX] Layer {self.layer_idx} | Value Cache contents: {past_key_value.value_cache[self.layer_idx]}")
+
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -229,7 +238,10 @@ def llama_attn_forward_cake(
             is_causal=self.is_causal,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
 
+        if not output_attentions:
+            attn_weights = None
 
 
     # we only want to evict once after prefill is done
@@ -251,23 +263,158 @@ def llama_attn_forward_cake(
                 v_seq_dim=2
             )(head_budgets, past_key_value, layer_idx)
         # Disable further eviction during decoding
-        for i in range(len(self.config.prefill)):
-            self.config.decoding_evict[i] = None
+        # for i in range(len(self.config.prefill)):
+        #     self.config.decoding_evict[i] = None
         self.config._eviction_done = True
 
-        for h, k in enumerate(past_key_value.key_cache[0]):
-            print(f"[MATRIX] Layer: {0} Key Cache Head {h} shape after eviction: {k.shape}")
-        for h, v in enumerate(past_key_value.value_cache[0]):
-            print(f"[MATRIX] Layer: {0} Value Cache Head {h} shape after eviction: {v.shape}")
+        print(f"[MATRIX] Layer {self.layer_idx} | Query States shape: {query_states.shape}")
+        print(f"[MATRIX] Layer {self.layer_idx} | Key States shape: {key_states.shape}")
+        print(f"[MATRIX] Layer {self.layer_idx} | Value States shape: {value_states.shape}")
+        print("----------------------")
 
+
+        # for h, k in enumerate(past_key_value.key_cache[0]):
+        #     print(f"[MATRIX] Layer: {0} Key Cache Head {h} shape after eviction: {k.shape}")
+        # for h, v in enumerate(past_key_value.value_cache[0]):
+        #     print(f"[MATRIX] Layer: {0} Value Cache Head {h} shape after eviction: {v.shape}")
+    print("POST EVICTION KV CACHE CONTENTS")
+    print(f"[MATRIX] Layer {self.layer_idx} | Key Cache shape: {past_key_value.key_cache[self.layer_idx].shape}")
+    print(f"[MATRIX] Layer {self.layer_idx} | Value Cache shape: {past_key_value.value_cache[self.layer_idx].shape}")
+    print(f"[MATRIX] Layer {self.layer_idx} | Key Cache contents: {past_key_value.key_cache[self.layer_idx]}")
+    print(f"[MATRIX] Layer {self.layer_idx} | Value Cache contents: {past_key_value.value_cache[self.layer_idx]}")
 
 
     if self.config.decoding_evict[self.layer_idx] is not None:
 
-        head_budgets = past_key_value.head_budgets[self.layer_idx]
-        print("[DECODING EVICT] Layer:", self.layer_idx, "Head Budgets:", head_budgets)
+        # print the shapes of KQV tensors
+        print(f"[MATRIX] Layer {self.layer_idx} | Query States shape: {query_states.shape}")
+        print(f"[MATRIX] Layer {self.layer_idx} | Key States shape: {key_states.shape}")
+        print(f"[MATRIX] Layer {self.layer_idx} | Value States shape: {value_states.shape}")
 
-        past_key_value = self.config.decoding_evict[self.layer_idx](head_budgets, past_key_value, self.layer_idx)
+        B, H, S, D = key_states.shape
+        device = key_states.device
+        head_budgets = past_key_value.head_budgets[self.layer_idx]
+        if len(head_budgets) == 32 and H == 8:
+            kv_head_budgets = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
+        else:
+            kv_head_budgets = head_budgets
+        # convert kv_head_budgets to a tuple of ints
+        kv_head_budgets = tuple(kv_head_budgets)
+
+        # outputs of attention per head
+        outputs = []    
+        for h in range(H):
+            # make the attn_mask for each head
+            attn_mask = torch.ones(B, 1, 1, S, device=device, dtype=torch.bool)
+            # print("[MATRIX] Head Number", h, "| kv_head_budgets[h] =", kv_head_budgets[h])
+            if kv_head_budgets[h] > 0:
+                keep_indices = torch.arange(S - kv_head_budgets[h], S, device=device)
+                attn_mask[:, :, :, keep_indices] = False
+            
+            # print(f"[MATRIX] Head Number {h} | attn_mask shape: {attn_mask.shape}")
+
+
+            # # attn_mask = past_key_value.attn_mask[self.layer_idx]
+            # if attn_mask.dim() == 3:
+            #     attn_mask = attn_mask.unsqueeze(2).expand(-1, -1, query_states.size(2), -1)
+
+            # float_mask = torch.zeros_like(attn_mask, dtype=query_states.dtype)
+            # float_mask = float_mask.masked_fill(attn_mask, float('-inf'))
+            # print(f"[MATRIX] Head Number {h} | float_mask shape: {float_mask.shape}")
+            print(f"[MATRIX] made it to decoding for head {h} in layer {self.layer_idx}")
+
+            q_len = query_states.size(2)  # Query length (typically 1 for decoding)
+            k_len = attn_mask.size(-1)    # Key length (should match cache length after eviction/padding)
+
+            causal_mask = torch.tril(torch.ones((q_len, k_len), dtype=torch.bool, device=attn_mask.device))  # [Q, S]
+            causal_mask = ~causal_mask  # Invert: True means masked (future tokens)
+            
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, Q, S]
+
+            print(f"[MATRIX] head {h} in Layer {self.layer_idx} | causal_mask shape: {causal_mask.shape}")
+
+            # Both masks are [B, H, Q, S] (broadcast causal_mask if needed)
+            combined_mask = attn_mask | causal_mask  # Logical OR: masked if either is masked
+
+            float_mask = torch.zeros_like(combined_mask, dtype=query_states.dtype)
+            float_mask = float_mask.masked_fill(combined_mask, float('-inf'))
+            # float_mask = float_mask.repeat_interleave(self.num_key_value_groups, dim=1)
+            # key_states = repeat_kv(key_states, self.num_key_value_groups)
+            # value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            
+
+            input_dtype = query_states.dtype
+            if input_dtype == torch.float32:
+                if torch.is_autocast_enabled():
+                    target_dtype = torch.get_autocast_gpu_dtype()
+                # Handle the case where the model is quantized
+                elif hasattr(self.config, "_pre_quantization_dtype"):
+                    target_dtype = self.config._pre_quantization_dtype
+                else:
+                    target_dtype = self.q_proj.weight.dtype
+
+                logger.warning_once(
+                    f"The input hidden states seems to be silently casted in float32, this might be related to"
+                    f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                    f" {target_dtype}."
+                )
+
+                query_states = query_states.to(target_dtype)
+                key_states = key_states.to(target_dtype)
+                value_states = value_states.to(target_dtype)
+
+            # query_states = query_states.transpose(1, 2)
+            # key_states = key_states.transpose(1, 2)
+            # value_states = value_states.transpose(1, 2)
+
+            dropout_rate = self.attention_dropout if self.training else 0.0
+
+            
+            print(f"[MATRIX] Layer {self.layer_idx} | Float Mask shape: {float_mask.shape}")
+
+            for g in range(self.num_key_value_groups):
+                qh = h * self.num_key_value_groups + g
+                q = query_states[:, qh:qh+1, :, :]       # [B, 1, q_len, D]
+                k = key_states[:, h:h+1, :, :]           # [B, 1, S, D]
+                v = value_states[:, h:h+1, :, :]         # [B, 1, S, D]
+                m = float_mask                  # [B, 1, q_len, S]
+
+                #print the shapes of q, k, v, m
+                print(f"[MATRIX] GQA {g} in Layer {self.layer_idx} | q shape: {q.shape}")
+                print(f"[MATRIX] GQA {g} in Layer {self.layer_idx} | k shape: {k.shape}")
+                print(f"[MATRIX] GQA {g} in Layer {self.layer_idx} | v shape: {v.shape}")
+                print(f"[MATRIX] GQA {g} in Layer {self.layer_idx} | m shape: {m.shape}")
+
+                # Run SDPA for this head-group
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=m, dropout_p=0.0, is_causal=False
+                )  # [B, 1, q_len, D]
+                outputs.append(out)
+
+        # Concatenate all outputs along the head dimension
+        attn_output = torch.cat(outputs, dim=1)  # [B, H * num_key_value_groups, q_len, D]
+        print("ATTENTION HAS BEEN COMPUTED FOR ALL HEADS")
+        print(f"[MATRIX] Layer {self.layer_idx} | attn_output shape: {attn_output.shape}")
+
+            # attn_output = F.scaled_dot_product_attention(
+            #     query_states,
+            #     key_states,
+            #     value_states,
+            #     attn_mask=float_mask,
+            #     dropout_p=0.0,
+            #     is_causal=False
+            # )
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        # head_budgets = past_key_value.head_budgets[self.layer_idx]
+        # print("[DECODING EVICT] Layer:", self.layer_idx, "Head Budgets:", head_budgets)
+
+        # past_key_value = self.config.decoding_evict[self.layer_idx](head_budgets, past_key_value, self.layer_idx)
 
         # tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -324,10 +471,7 @@ def llama_attn_forward_cake(
     # )
 
     # attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-    attn_output = self.o_proj(attn_output)
-
-    if not output_attentions:
-        attn_weights = None
+    
 
     return attn_output, attn_weights, past_key_value
 

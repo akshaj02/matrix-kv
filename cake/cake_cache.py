@@ -347,7 +347,9 @@ class CakeprefillKVCache:
             past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
         
         return past_key_values
+    
 
+### Function I made to evict the KV Cache and pad the cache to a the max length of the cache in that layer
 class MatrixDecodingKVCache:
     def __init__(self, head_budgets, window_size=32, k_seq_dim=2, v_seq_dim=2):
         self.head_budgets = head_budgets
@@ -364,6 +366,9 @@ class MatrixDecodingKVCache:
         """
         key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
         value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
+
+        # print(f"[MATRIX] layer {layer_idx} key_cache shape: {key_cache.shape}")
+        # print(f"[MATRIX] layer {layer_idx} value_cache shape: {value_cache.shape}")
         B, H, S, D = key_cache.shape
         device = key_cache.device
 
@@ -376,18 +381,74 @@ class MatrixDecodingKVCache:
 
         new_key_cache = []
         new_value_cache = []
+
+
+        kept_per_head = []
+
         for h in range(H):
             k = kv_head_budgets[h]
             k = max(k, self.window_size)  # Always keep at least the window
+
+            # for maskign
+            kept_per_head.append(k)
+        
+        max_k = max(kept_per_head)
+        print(f"[MATRIX] for layer {layer_idx}, max_k: {max_k}")
+        for h in range(H):
+            k = kept_per_head[h]
             # Keep the last k tokens for this head
             kept_indices = torch.arange(S - k, S, device=device)
-            # [B, S, D] for this head
-            new_key_cache.append(key_cache[:, h, kept_indices, :])
-            new_value_cache.append(value_cache[:, h, kept_indices, :])
-        # Stack back: [B, H, k, D]
-        past_key_values.key_cache[layer_idx] = [k for k in new_key_cache]
-        past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
+            # # [B, S, D] for this head
+            # new_key_cache.append(key_cache[:, h, kept_indices, :])
+            # new_value_cache.append(value_cache[:, h, kept_indices, :])
+
+            # intermediate – for masking
+            k_cache = key_cache[:, h, kept_indices, :]
+            v_cache = value_cache[:, h, kept_indices, :]
+
+            # Pad to max_k
+
+            pad_len = max_k - k
+            if pad_len > 0:
+                pad_shape = (B, pad_len, D)
+                k_cache = torch.cat([torch.zeros(pad_shape, device=device, dtype=k_cache.dtype), k_cache], dim=1)
+                v_cache = torch.cat([torch.zeros(pad_shape, device=device, dtype=v_cache.dtype), v_cache], dim=1)
+                # mask = torch.cat([torch.ones(B, pad_len, device=device, dtype=torch.bool), torch.zeros(B, k, device=device, dtype=torch.bool)], dim=1)
+
+            else:
+                mask = torch.zeros(B, k, device=device, dtype=torch.bool)
+            
+            # Append to new caches
+            new_key_cache.append(k_cache)
+            new_value_cache.append(v_cache)
+            # mask_list.append(mask)
+
+        # Stack to shape [B, H, max_k, D]
+        # can stack now since all heads have the same max_k
+        key_out = torch.stack(new_key_cache, dim=1)
+        value_out = torch.stack(new_value_cache, dim=1)
+        # mask_out = torch.stack(mask_list, dim=1)  # [B, H, max_k]
+
+
+
+
+        # #  back: [B, H, k, D]
+        # past_key_values.key_cache[layer_idx] = [k for k in new_key_cache]
+        # past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
+
+        # Update caches and attach mask for this layer
+        past_key_values.key_cache[layer_idx] = key_out
+        past_key_values.value_cache[layer_idx] = value_out
+        # if not hasattr(past_key_values, 'attn_mask'):
+            # past_key_values.attn_mask = {}
+        # past_key_values.attn_mask[layer_idx] = mask_out
+
+        # now print post eviction shapes
+        # print(f"[MATRIX] After eviction, layer {layer_idx} key_cache shape: {past_key_values.key_cache[layer_idx].shape}")
+        # print(f"[MATRIX] After eviction, layer {layer_idx} value_cache shape: {past_key_values.value_cache[layer_idx].shape}")
+
         return past_key_values
+
         
     
 class CakeDecodingKVCache_LayerWise:

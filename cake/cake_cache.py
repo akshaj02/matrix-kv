@@ -240,14 +240,14 @@ class CakeprefillKVCache:
         past_key_values.head_budgets = head_budgets
         # print(f"[CAKE] Head Budgets: {past_key_values.head_budgets}")
         # print(f"[CAKE] Stored head_budgets in past_key_values: {head_budgets}")
-        # for layer_idx in head_budgets:
-        #     past_key_values = self.evict_kvcache_headwise(
-        #         past_key_values,
-        #         layer_idx,
-        #         head_budgets[layer_idx],
-        #         self.window_size
-        #     )
-            # past_key_values.layer_budget[layer_idx] = sum(head_budgets[layer_idx])
+        for layer_idx in head_budgets:
+            past_key_values = self.evict_kvcache_headwise(
+                past_key_values,
+                layer_idx,
+                head_budgets[layer_idx],
+                self.window_size
+            )
+            past_key_values.layer_budget[layer_idx] = sum(head_budgets[layer_idx])
 
         # head_budgets = compute_head_budgets(evict_scores, total_budget=self.total_size, window_size=self.window_size)
 
@@ -319,34 +319,79 @@ class CakeprefillKVCache:
         """
         key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
         value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
+        hh_score = past_key_values.evict_scores[layer_idx]    # [B, H, S]
 
-        print(layer_idx)
         B, H, S, D = key_cache.shape
         device = key_cache.device
-        print("NUM HEADS IN CACHE: ", H)
-
-        if len(head_budgets) == 32 and H == 8:
-            kv_head_budgets = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
-        else:
-            kv_head_budgets = head_budgets
-
-        new_key_cache = []
-        new_value_cache = []
+        
+        # Analyze budget distribution vs uniform allocation (i think this is incorrect calcuation)
+        uniform_budget = sum(head_budgets) // H
+        total_available = S - window_size
+        
+        budget_variance = np.var(head_budgets)
+        budget_efficiency = []
+        
         for h in range(H):
-            # Get the budget for the current head
-            k = kv_head_budgets[h]
-            print(f"[CAKE] Allocated budget for head {h}: {k}")
-            # Get the key and value states for the current head
-            k = max(k, window_size)  # Ensure at least the window size is kept
-            # keep the last k tokens for the current head
-            kept_indices = torch.arange(S - k, S, device=device)
-            new_key_cache.append(key_cache[0, h, kept_indices, :])
-            new_value_cache.append(value_cache[0, h, kept_indices, :])
+            allocated_budget = head_budgets[h]
+            available_tokens = total_available
+            
+            # Calculate utilization metrics
+            utilization = min(allocated_budget / available_tokens, 1.0) * 100 if available_tokens > 0 else 0
+            efficiency = allocated_budget / uniform_budget if uniform_budget > 0 else 1.0
+            
+            budget_efficiency.append(efficiency)
+            
+            
+        # useless logging why did I do this
+        # Summary statistics
+        avg_efficiency = np.mean(budget_efficiency)
+        max_efficiency = np.max(budget_efficiency)
+        min_efficiency = np.min(budget_efficiency)
 
-            past_key_values.key_cache[layer_idx] = [k for k in new_key_cache]
-            past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
+        
+        # TODO: Real eviction logic lol 
         
         return past_key_values
+
+
+    #### VERSION THAT ACTUALLY EVICTS, COMMENTED RIGHT NOW
+    # def evict_kvcache_headwise(self, past_key_values, layer_idx, head_budgets, window_size):
+    #     """
+    #     Dynamic budget allocation per head with detailed logging
+
+    #     ** Note: Tried to implement the logger, but it adds too much information which is redundant. 
+    #     Didn't feel like removing it but doesn't affect the functionality.
+    #     """
+    #     key_cache = past_key_values.key_cache[layer_idx]      # [B, H, S, D]
+    #     value_cache = past_key_values.value_cache[layer_idx]  # [B, H, S, D]
+
+    #     print(layer_idx)
+    #     B, H, S, D = key_cache.shape
+    #     device = key_cache.device
+    #     print("NUM HEADS IN CACHE: ", H)
+
+    #     if len(head_budgets) == 32 and H == 8:
+    #         kv_head_budgets = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
+    #     else:
+    #         kv_head_budgets = head_budgets
+
+    #     new_key_cache = []
+    #     new_value_cache = []
+    #     for h in range(H):
+    #         # Get the budget for the current head
+    #         k = kv_head_budgets[h]
+    #         print(f"[CAKE] Allocated budget for head {h}: {k}")
+    #         # Get the key and value states for the current head
+    #         k = max(k, window_size)  # Ensure at least the window size is kept
+    #         # keep the last k tokens for the current head
+    #         kept_indices = torch.arange(S - k, S, device=device)
+    #         new_key_cache.append(key_cache[0, h, kept_indices, :])
+    #         new_value_cache.append(value_cache[0, h, kept_indices, :])
+
+    #         past_key_values.key_cache[layer_idx] = [k for k in new_key_cache]
+    #         past_key_values.value_cache[layer_idx] = [v for v in new_value_cache]
+        
+    #     return past_key_values
     
 
 ### Function I made to evict the KV Cache and pad the cache to a the max length of the cache in that layer
@@ -469,7 +514,13 @@ class CakeDecodingKVCache_LayerWise:
         self.hh_score = None
 
     def __call__(self, past_key_values, attn_score_cache, layer_idx):
+
+        print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
         num_heads = attn_score_cache.shape[1]
+
+        # shape of key value cache
+        print("[CAKE] Key cache shape:", past_key_values.key_cache[layer_idx].shape)
+        print("[CAKE] Value cache shape:", past_key_values.value_cache[layer_idx].shape)
         bsz, num_key_value_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
         num_key_value_groups = num_heads // num_key_value_heads
 
@@ -497,6 +548,9 @@ class CakeDecodingKVCache_LayerWise:
 
         past_key_values.key_cache[layer_idx] = key_states
         past_key_values.value_cache[layer_idx] = value_states
+
+        print("[CAKE] After eviction, key cache shape:", past_key_values.key_cache[layer_idx].shape)
+        print("[CAKE] After eviction, value cache shape:", past_key_values.value_cache[layer_idx].shape)
 
         return past_key_values
 

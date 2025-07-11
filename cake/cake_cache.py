@@ -513,46 +513,139 @@ class CakeDecodingKVCache_LayerWise:
         self.v_seq_dim = v_seq_dim
         self.hh_score = None
 
-    def __call__(self, past_key_values, attn_score_cache, layer_idx):
 
-        print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
-        num_heads = attn_score_cache.shape[1]
+    def __call__(self, past_key_values, attn_score_cache, layer_idx, head_budgets):
+        # print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
 
-        # shape of key value cache
-        print("[CAKE] Key cache shape:", past_key_values.key_cache[layer_idx].shape)
-        print("[CAKE] Value cache shape:", past_key_values.value_cache[layer_idx].shape)
-        bsz, num_key_value_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
-        num_key_value_groups = num_heads // num_key_value_heads
+        num_heads = attn_score_cache.shape[1]  # query heads, 32
+        bsz, num_kv_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
+        device = past_key_values.key_cache[layer_idx].device
+        num_groups = num_heads // num_kv_heads  # typically 4
 
-        seq_len = past_key_values.key_cache[layer_idx].size(self.k_seq_dim)
         if seq_len <= self.cache_size:
             return past_key_values
 
-        attn_cache = attn_score_cache[:, :, :, :-self.window_size].mean(dim = -2)
+        # Step 1: Reduce scores to per-head values (mean over query)
+        attn_cache = attn_score_cache[:, :, :, :-self.window_size].mean(dim=-2)  # [B, 32, S-window]
 
-        attn_cache = F.avg_pool1d(attn_cache, kernel_size = 5, padding=5//2, stride=1)
-        attn_cache = attn_cache.reshape(bsz, num_key_value_heads, num_key_value_groups, -1)
+        # Step 2: Smooth scores with avg pooling
+        attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=2, stride=1)
 
-        attn_cache = attn_cache.mean(dim=-2)
+        # Step 3: Reshape to KV head grouping
+        attn_cache = attn_cache.reshape(bsz, num_kv_heads, num_groups, -1)  # [B, 8, 4, S]
+        attn_cache = attn_cache.mean(dim=2)  # [B, 8, S] — 1 score per KV head
 
-        indices = attn_cache.topk(self.hh_size, dim=-1).indices
-        # indices = indices.sort().values
-        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        # Step 4: Group budgets from 32 heads → 8 KV heads
+        if len(head_budgets) == 32 and num_kv_heads == 8:
+            head_budgets_grouped = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
+        else:
+            head_budgets_grouped = head_budgets
 
-        k_past_compress = past_key_values.key_cache[layer_idx][:, :, :-self.window_size, :].gather(dim=2, index=indices)
-        v_past_compress = past_key_values.value_cache[layer_idx][:, :, :-self.window_size, :].gather(dim=2, index=indices)
-        k_cur = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]
-        v_cur = past_key_values.value_cache[layer_idx][:, :, -self.window_size:, :]
-        key_states = torch.cat([k_past_compress, k_cur], dim=2)
-        value_states = torch.cat([v_past_compress, v_cur], dim=2)
+        # head_budgets_grouped = [sum(head_budgets[i*4:(i+1)*4]) for i in range(num_kv_heads)]  # [8]
 
-        past_key_values.key_cache[layer_idx] = key_states
-        past_key_values.value_cache[layer_idx] = value_states
+        # Step 5: Get indices per KV head
+        max_k = max([max(k, self.window_size) for k in head_budgets_grouped])
+        print(f"[CAKE] For layer {layer_idx}, max_k (for padding): {max_k}")
+        
+        new_key_cache = []
+        new_value_cache = []
 
-        print("[CAKE] After eviction, key cache shape:", past_key_values.key_cache[layer_idx].shape)
-        print("[CAKE] After eviction, value cache shape:", past_key_values.value_cache[layer_idx].shape)
+        # Past cache excluding window
+        past_kv_len = seq_len - self.window_size
+        key_past = past_key_values.key_cache[layer_idx][:, :, :past_kv_len, :]  # [B, H, S-w, D]
+        value_past = past_key_values.value_cache[layer_idx][:, :, :past_kv_len, :]
+
+        for h in range(num_kv_heads):
+            k = max(head_budgets_grouped[h], self.window_size)
+
+            # Top-k indices for head h
+            scores = attn_cache[:, h, :]  # [B, S-window]
+            topk_indices = scores.topk(k, dim=-1).indices  # [B, k]
+            topk_indices = topk_indices.unsqueeze(-1).expand(-1, -1, head_dim)  # [B, k, D]
+
+            # Gather K/V tokens for this head
+            key_sel = key_past[:, h].gather(dim=1, index=topk_indices)  # [B, k, D]
+            value_sel = value_past[:, h].gather(dim=1, index=topk_indices)
+
+            # print the shapes of selected keys and values
+            print(f"[CAKE] Layer {layer_idx}, Head {h}: Selected key shape: {key_sel.shape}, Selected value shape: {value_sel.shape}")
+
+            # Pad if needed
+            pad_len = max_k - k
+            if pad_len > 0:
+                pad_shape = (bsz, pad_len, head_dim)
+                eps = 1e-6
+                key_pad = torch.full(pad_shape, eps, device=device, dtype=key_sel.dtype)
+                value_pad = torch.full(pad_shape, eps, device=device, dtype=value_sel.dtype)
+
+                key_sel = torch.cat([key_pad, key_sel], dim=1)  # [B, max_k, D]
+                value_sel = torch.cat([value_pad, value_sel], dim=1)
+
+            print(f"[CAKE] Layer {layer_idx}, Head {h}: After padding, key shape: {key_sel.shape}, value shape: {value_sel.shape}")
+            new_key_cache.append(key_sel)
+            new_value_cache.append(value_sel)
+
+        # Stack across heads: [B, H, max_k, D]
+        key_compressed = torch.stack(new_key_cache, dim=1)
+        value_compressed = torch.stack(new_value_cache, dim=1)
+
+        # Keep the current window (last W tokens)
+        key_window = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]
+        value_window = past_key_values.value_cache[layer_idx][:, :, -self.window_size:, :]
+
+        # Concatenate compressed + window → final [B, H, max_k + W, D]
+        key_final = torch.cat([key_compressed, key_window], dim=2)
+        value_final = torch.cat([value_compressed, value_window], dim=2)
+
+        # Update cache
+        past_key_values.key_cache[layer_idx] = key_final
+        past_key_values.value_cache[layer_idx] = value_final
+
+        print("[CAKE] After eviction, key cache shape:", key_final.shape)
+        print("[CAKE] After eviction, value cache shape:", value_final.shape)
 
         return past_key_values
+
+    # def __call__(self, past_key_values, attn_score_cache, layer_idx):
+
+    #     print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
+    #     num_heads = attn_score_cache.shape[1]
+
+    #     # shape of key value cache
+    #     print("[CAKE] Key cache shape:", past_key_values.key_cache[layer_idx].shape)
+    #     print("[CAKE] Value cache shape:", past_key_values.value_cache[layer_idx].shape)
+    #     bsz, num_key_value_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
+    #     num_key_value_groups = num_heads // num_key_value_heads
+
+    #     seq_len = past_key_values.key_cache[layer_idx].size(self.k_seq_dim)
+    #     if seq_len <= self.cache_size:
+    #         return past_key_values
+
+    #     attn_cache = attn_score_cache[:, :, :, :-self.window_size].mean(dim = -2)
+
+    #     attn_cache = F.avg_pool1d(attn_cache, kernel_size = 5, padding=5//2, stride=1)
+    #     attn_cache = attn_cache.reshape(bsz, num_key_value_heads, num_key_value_groups, -1)
+
+    #     attn_cache = attn_cache.mean(dim=-2)
+
+    #     indices = attn_cache.topk(self.hh_size, dim=-1).indices
+    #     # indices = indices.sort().values
+    #     indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+    #     k_past_compress = past_key_values.key_cache[layer_idx][:, :, :-self.window_size, :].gather(dim=2, index=indices)
+    #     v_past_compress = past_key_values.value_cache[layer_idx][:, :, :-self.window_size, :].gather(dim=2, index=indices)
+    #     k_cur = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]
+    #     v_cur = past_key_values.value_cache[layer_idx][:, :, -self.window_size:, :]
+    #     key_states = torch.cat([k_past_compress, k_cur], dim=2)
+    #     value_states = torch.cat([v_past_compress, v_cur], dim=2)
+
+    #     past_key_values.key_cache[layer_idx] = key_states
+    #     past_key_values.value_cache[layer_idx] = value_states
+
+    #     print("[CAKE] After eviction, key cache shape:", past_key_values.key_cache[layer_idx].shape)
+    #     print("[CAKE] After eviction, value cache shape:", past_key_values.value_cache[layer_idx].shape)
+
+    #     return past_key_values
 
     def _update_hh_score(self, attn_score_cache, num_key_value_heads):
 

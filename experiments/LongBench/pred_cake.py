@@ -65,8 +65,8 @@ def build_chat(tokenizer, prompt, model_name):
 
 
 @torch.inference_mode()
-def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, compress_config):
-
+def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, cache_size):
+    sample_num = 0
     for json_obj in tqdm(data):
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
@@ -80,11 +80,7 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
 
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
-        
-        if compress and hasattr(tokenizer, "compress_config") and tokenizer.compress_config.head_budgets is not None:
-            # propagate to all layers
-            for i in range(len(model.model.layers)):
-                model.model.layers[i].self_attn.config.head_budgets = tokenizer.compress_config.head_budgets
+
         if dataset == "samsum":
             output = model.generate(
                 **input,
@@ -103,10 +99,12 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
                 do_sample=False,
                 temperature=1.0,
             )[0]
-         # ADD MEMORY CLEANUP HERE - after generation, before model reset
         import gc
         torch.cuda.empty_cache()
         gc.collect()
+        # for i in range(len(model.model.layers)):
+        #     if hasattr(past_key_value, 'prefill_head_norms'):
+        #         print(f"I have found the prefill_head_norms, they look like this for layer {i}: ")
 
         if compress:
             layers = len(model.model.layers)
@@ -116,10 +114,57 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
 
         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
 
+        # import json
+        # import numpy as np
+
+        # num_layers = 32  # adjust if needed
+        # num_heads = 32
+
+        # # Initialize sum and count
+        # decoding_sums = {str(layer): np.zeros(num_heads) for layer in range(num_layers)}
+        # decoding_counts = {str(layer): 0 for layer in range(num_layers)}
+
+        # # Read all lines from the temp file and add up
+        # with open("sample_xyz_decoding_norms.tmp", "r") as f:
+        #     for line in f:
+        #         token_norms = json.loads(line)
+        #         for layer, head_norms in token_norms.items():
+        #             decoding_sums[layer] += np.array(head_norms)
+        #             decoding_counts[layer] += 1
+
+        # # Make decoding averages
+        # decoding_avgs = {}
+        # for layer in decoding_sums:
+        #     if decoding_counts[layer] > 0:
+        #         decoding_avgs[layer] = (decoding_sums[layer] / decoding_counts[layer]).tolist()
+        #     else:
+        #         decoding_avgs[layer] = [0.0] * num_heads
+
+        # # ---- Read prefill norms ----
+        # with open("sample_xyz_prefill_norms.tmp", "r") as f:
+        #     prefill_data = json.load(f)  # should contain a "prefill" key
+
+        # # ---- Build and save the master dict ----
+        # master_dict = {
+        #     "prefill": prefill_data["prefill"],  # original prefill numbers
+        #     "decoding": decoding_avgs
+        # }
+        # folder_path = f"./scaling_experiment_norm/cache{cache_size}/LongBench/{model_name}/{dataset}"
+        # os.makedirs(folder_path, exist_ok=True)
+        # # final headnorm file name
+        # filename = f"sample_{sample_num}_headnorm.json"
+        # sample_num += 1
+        # final_filename = os.path.join(folder_path, filename)
+        # print(final_filename)
+
+
+        # with open(final_filename, "w") as f:
+        #     json.dump(master_dict, f, indent=2)
+
+
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
             f.write('\n')
-
 
 
 def seed_everything(seed):
@@ -131,81 +176,8 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-# def load_model_and_tokenizer(path, model_name, device, compress_config):
-
-#     # Step 1: Apply monkeypatch first
-#     if compress_config.compress:
-#         if "llama" in model_name:
-#             from cake.monkeypatch import replace_flashllama_attn_with_cakeattn
-#             replace_flashllama_attn_with_cakeattn()
-#         elif "mistral" in model_name:
-#             from cake.monkeypatch import replace_flashmistral_attn_with_cakeattn
-#             replace_flashmistral_attn_with_cakeattn()
-#         elif "qwen2" in model_name:
-#             from cake.monkeypatch import replace_flashqwen2_attn_with_cakeattn
-#             replace_flashqwen2_attn_with_cakeattn()
-
-#     # Step 2: Set dtype
-#     dtype = torch.bfloat16 if "qwen2" in model_name else torch.float16
-
-#     # Step 3: Load tokenizer and model (still on CPU)
-#     tokenizer = AutoTokenizer.from_pretrained(path)
-#     # model = AutoModelForCausalLM.from_pretrained(
-#     #     path,
-#     #     torch_dtype=dtype,
-#     #     attn_implementation="flash_attention_2"
-#     # )
-
-#     # # Step 4: Move model to GPU *after* monkeypatch
-#     # model = model.to(device)
-
-#     ##### MULTI GPU SUPPORT #####
-#     # Modified code for dual GPU support:
-#     model = AutoModelForCausalLM.from_pretrained(
-#         path,
-#         torch_dtype=dtype,
-#         attn_implementation="flash_attention_2",
-#         device_map="auto"  # Add this line for automatic GPU distribution
-#     )
-
-#     # Step 4: Remove the manual .to(device) call since device_map handles placement
-#     # model = model.to(device)  # Comment out or remove this line
-#     print("Model device map:", getattr(model, 'hf_device_map', 'No device map found'))
-
-#     # Step 5: Only now access config/layers
-#     config = AutoConfig.from_pretrained(path)
-#     if hasattr(config, 'num_hidden_layers'):
-#         layers = config.num_hidden_layers
-
-#     if compress_config.compress:
-#         model.config.head_budgets = None
-#         for i in range(layers):
-#             model.model.layers[i].self_attn.config.key_size = [compress_config.cache_size - compress_config.window_size]*layers
-#             model.model.layers[i].self_attn.config.window_size = [compress_config.window_size]*layers
-#             model.model.layers[i].self_attn.config.prefill = [True]*layers
-#             model.model.layers[i].self_attn.config.decoding_evict = [None]*layers
-#             model.model.layers[i].self_attn.config.tau1 = compress_config.hyper[0]
-#             model.model.layers[i].self_attn.config.tau2 = compress_config.hyper[1] 
-#             model.model.layers[i].self_attn.config.gamma = compress_config.hyper[2] 
-#             model.model.layers[i].self_attn.config = model.config
-#             model.model.layers[i].self_attn.config.prefill_cake_evict = [CakeprefillKVCache(
-#                 cache_size=compress_config.cache_size,
-#                 window_size=compress_config.window_size,
-#                 k_seq_dim=2,
-#                 v_seq_dim=2,
-#                 num_heads=model.model.layers[i].self_attn.num_heads,
-#                 num_layers=layers,
-#                 use_cascading=compress_config.cascading, 
-#                 config=compress_config,
-#                 model_layers=model.model.layers
-#             )]*layers
-
-#     model = model.eval()
-#     return model, tokenizer
-
 def load_model_and_tokenizer(path, model_name, device, compress_config):
 
-    # Step 1: Apply monkeypatch first
     if compress_config.compress:
         if "llama" in model_name:
             from cake.monkeypatch import replace_flashllama_attn_with_cakeattn
@@ -217,73 +189,55 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
             from cake.monkeypatch import replace_flashqwen2_attn_with_cakeattn
             replace_flashqwen2_attn_with_cakeattn()
 
-    # Step 2: Set dtype
-    dtype = torch.bfloat16 if "qwen2" in model_name else torch.float16
-
-    # Step 3: Load tokenizer and model
+    if "qwen2" in model_name:
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float16
+   
     tokenizer = AutoTokenizer.from_pretrained(path)
     model = AutoModelForCausalLM.from_pretrained(
-        path,
-        torch_dtype=dtype,
-        attn_implementation="flash_attention_2",
-        device_map="auto"
-    )
-
-    print("Model device map:", getattr(model, 'hf_device_map', 'No device map found'))
-
-    # Step 4: Get layers count
-    if hasattr(model.config, 'num_hidden_layers'):
-        layers = model.config.num_hidden_layers
+        path, torch_dtype=dtype,
+        attn_implementation="flash_attention_2"
+    ).to(device)
+    config = AutoConfig.from_pretrained(path)
+    
+    if hasattr(config, 'num_hidden_layers'):
+        layers = config.num_hidden_layers
 
     if compress_config.compress:
-        # Add head_budgets attribute to the main config
-        model.config.head_budgets = None
-        
-        # Create a single prefill cache instance
-        prefill_cache = CakeprefillKVCache(
-            cache_size=compress_config.cache_size,
-            window_size=compress_config.window_size,
-            k_seq_dim=2,
-            v_seq_dim=2,
-            num_heads=model.model.layers[0].self_attn.num_heads,
-            num_layers=layers,
-            use_cascading=compress_config.cascading, 
-            config=compress_config,
-            model_layers=model.model.layers
-        )
-        
-        # Set layer-specific attributes
         for i in range(layers):
-            # Make each layer's self_attn reference the main config
-            model.model.layers[i].self_attn.config = model.config
-            
-        # Add other attributes to the main config (not per-layer)
-        model.config.key_size = [compress_config.cache_size - compress_config.window_size] * layers
-        model.config.window_size = [compress_config.window_size] * layers
-        model.config.prefill = [True] * layers
-        model.config.decoding_evict = [None] * layers
-        model.config.tau1 = compress_config.hyper[0]
-        model.config.tau2 = compress_config.hyper[1] 
-        model.config.gamma = compress_config.hyper[2]
-        model.config.prefill_cake_evict = [prefill_cache] * layers
+            model.model.layers[i].self_attn.config.key_size = [compress_config.cache_size - compress_config.window_size]*layers
+            model.model.layers[i].self_attn.config.window_size = [compress_config.window_size]*layers
+            model.model.layers[i].self_attn.config.prefill = [True]*layers
+            model.model.layers[i].self_attn.config.decoding_evict = [None]*layers
+            model.model.layers[i].self_attn.config.tau1 = compress_config.hyper[0]
+            model.model.layers[i].self_attn.config.tau2 = compress_config.hyper[1] 
+            model.model.layers[i].self_attn.config.gamma = compress_config.hyper[2] 
+            model.model.layers[i].self_attn.config.prefill_cake_evict = [CakeprefillKVCache(
+                cache_size=compress_config.cache_size,
+                window_size=compress_config.window_size,
+                k_seq_dim=2,
+                v_seq_dim=2,
+                num_heads=model.model.layers[i].self_attn.num_heads,
+                num_layers=layers,
+                use_cascading=compress_config.cascading
+            )]*layers
 
     model = model.eval()
-    return model, tokenizer
 
+    
+    return model, tokenizer
 
 if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
-
     pred_name = args.pred_name
     model_name = args.model
-
     compress = args.compress
     cascading = args.cascading
     compress_config = CompressConfig(compress, cascading)
     model2path = json.load(open("experiments/LongBench/config/model2path.json", "r"))
     model2maxlen = json.load(open("experiments/LongBench/config/model2maxlen.json", "r"))
-    compress_config.head_budgets = None
     # define your model
     max_length = model2maxlen[model_name]
     if compress:
@@ -308,14 +262,11 @@ if __name__ == '__main__':
 
     model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device, compress_config)
 
-    # datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
-    #                 "gov_report", ]
-
-    # datasets = ["qasper_mod"]
-                
     datasets = ["narrativeqa", "qasper", "multifieldqa_en",  "hotpotqa", "2wikimqa", "musique", \
-                "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+                    "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
                 "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    
+    # datasets = ["multi_news"]
 
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("experiments/LongBench/config/dataset2prompt.json", "r"))
@@ -324,20 +275,19 @@ if __name__ == '__main__':
     if not os.path.exists(f"./pred_result/{cache_name}/{pred_name}"):
         os.makedirs(f"./pred_result/{cache_name}/{pred_name}")
     
-    for dataset in datasets:  
-        # Load dataset
+    for dataset in datasets:
+        #load offline 
         data_files = {"test": f"{dataset}.jsonl"}
         data = load_dataset("json", data_dir='./datasets/longbench/data', split='test', data_files=data_files)
 
         if not os.path.exists(f"./pred_result/{cache_name}/{pred_name}/{model_name}"):
             os.makedirs(f"./pred_result/{cache_name}/{pred_name}/{model_name}")
         out_path = f"./pred_result/{cache_name}/{pred_name}/{model_name}/{dataset}.jsonl"
-
+    
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
 
-        # Handle existing results
         if os.path.exists(out_path):
             with open(out_path, 'r', encoding='utf-8') as file:
                 lines = file.readlines()
@@ -345,7 +295,7 @@ if __name__ == '__main__':
             if len(data_all) == len(lines):
                 continue
             else:
-                data_all = data_all[len(lines):]
+                data_all=data_all[len(lines):]
 
-        get_pred(model, tokenizer, compress, data_all, max_length, 
-                max_gen, prompt_format, dataset, model_name, model2path, out_path, compress_config)
+        get_pred(model, tokenizer, compress, data_all, max_length, \
+                                    max_gen, prompt_format, dataset, model_name, model2path, out_path, args.cache_size)

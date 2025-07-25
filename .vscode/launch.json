@@ -8,15 +8,12 @@
         "program": "${workspaceFolder}/experiments/LongBench/pred_cake.py",
         "console": "integratedTerminal",
         "env": {
-          "CUDA_VISIBLE_DEVICES": "1,2",
-          "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"
+          "CUDA_VISIBLE_DEVICES": "1"
         },
         "args": [
           "--model", "llama3.1-8b-128k",
           "--compress",
-          "--cascading",
-          "--pred_name", "CAKE_Static_testing_pred_result",
-          "--device", "0",
+          "--pred_name", "Matrix_debug",
           "--cache_size", "1024",
           "--window_size", "32"
         ]

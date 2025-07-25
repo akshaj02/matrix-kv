@@ -8,3 +8,8 @@ pred_result/
 models/
 longbench_budget_logs/
 plot.ipynb
+sample_xyz_decoding_norms.tmp
+sample_xyz_headnorms.json
+sample_xyz_master_headnorms.json
+sample_xyz_prefill_norms.tmp
+size.py

@@ -150,14 +150,54 @@ def qwen2_attn_forward_cake(
 
 
 
+    # if self.config.decoding_evict[self.layer_idx] is not None:
+
+    #     tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+    #     tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+    #     past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx)
     if self.config.decoding_evict[self.layer_idx] is not None:
+        if not past_key_value.turn_off_eviction:
+            tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            # budget masking, no eviction
+            if hasattr(past_key_value, 'head_budgets') and past_key_value.head_budgets:
+                head_budgets = past_key_value.head_budgets.get(self.layer_idx)
+                if head_budgets is not None:
+                    #print(f"[CAKE] Layer {self.layer_idx} | Applying decoding budget mask: {head_budgets}")
+                    
+                    B, H, Q, S = tmp_attn_weights.shape
+                    device = tmp_attn_weights.device
 
-        tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    # Build the mask: True means "mask this token"
+                    mask = torch.ones(H, S, dtype=torch.bool, device=device)
+                    for h in range(H):
+                        k = head_budgets[h]
+                        if k > 0:
+                            keep_indices = torch.arange(S - k, S, device=device)
+                            mask[h, keep_indices] = False  # False = not masked (keep)
+                    # === VERIFICATION: Count masked positions ===
+                    total_positions = H * S
+                    masked_positions = mask.sum().item()
+                    kept_positions = total_positions - masked_positions
+                    masking_percentage = (masked_positions / total_positions) * 100
+                    
+                    # print(f"[MASK] Layer {self.layer_idx} | Total: {total_positions}, Masked: {masked_positions}, Kept: {kept_positions}, Masked%: {masking_percentage:.1f}%")
+                    
+                    # Per-head breakdown
+                    masked_per_head = mask.sum(dim=1)  # [H]
+                    kept_per_head = S - masked_per_head
+                    # print(f"[MASK] Layer {self.layer_idx} | Kept per head: {kept_per_head.tolist()}")
+                    # print(f"[MASK] Layer {self.layer_idx} | Expected budgets: {head_budgets}")
+                    # Expand mask for broadcasting: [1, H, 1, S]
+                    attn_mask = mask.unsqueeze(0).unsqueeze(2)  # [1, H, 1, S]
+                    tmp_attn_weights = tmp_attn_weights.masked_fill(attn_mask, float('-inf'))
 
-        past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx)
-    
+            tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+            past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx, head_budgets)
+
 
     # In PEFT, usually we cast the layer norms in float32 for training stability reasons
     # therefore the input hidden states gets silently casted in float32. Hence, we need

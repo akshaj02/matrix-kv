@@ -30,7 +30,7 @@ Below are the scores for **each method on LongBench (cache size = 1024)**, with 
 | Method | NrtvQA | Qasper | MF-en | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PCount | PR-en | Lcc | RB-P | **Avg.** |
 | :-- | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :--: | :-- | :-- | :--: |
 | **FullAttention** | 30.96 | 45.49 | 53.78 | 55.04 | 47.14 | 31.42 | 34.88 | 25.29 | 27.55 | 72.5 | 91.65 | 43.67 | 6 | 99.5 | 63.19 | 56.56 | 49.04 |
-| **MATRIX-KV<br/>(Static 1024)** | 29.84 | **45.93** | **53.78** | 55.04 | 46.63 | **30.92** | **34.64** | 25.35 | 27.52 | **73** | 91.65 | 43.53 | 6 | 99.5 | 63.33 | 56.34 | **48.94** |
+| **Matrix-KV** | 29.84 | **45.93** | **53.78** | 55.04 | 46.63 | **30.92** | **34.64** | 25.35 | 27.52 | **73** | 91.65 | 43.53 | 6 | 99.5 | 63.33 | 56.34 | **48.94** |
 | CAKE | 30.88 | 44.95 | 52.38 | **55.49** | **46.99** | 30.82 | 28.68 | 24.91 | 26.39 | 69 | 91.94 | 42.60 | 6 | 99.5 | 62.65 | 56.89 | 48.13 |
 | SnapKV | **30.95** | 44.74 | 52.58 | 55.09 | 46.83 | 30.37 | 27.87 | 24.57 | 25.99 | 68 | 92.03 | 42.60 | 6.5 | 99.5 | 63.00 | 56.50 | 47.95 |
 | PyramidKV | 30.54 | 43.64 | 52.73 | 55.29 | 46.29 | 31.28 | 27.53 | 24.50 | 26.00 | 68 | 92.09 | 41.75 | 6.05 | 99.5 | 62.35 | 55.44 | 47.69 |
@@ -49,7 +49,7 @@ Below are the scores for **each method on LongBench (cache size = 1024)**, with 
 
 - **MATRIX-KV** establishes a new baseline for *predictable, explainable, and high-performing KV cache allocation*, narrowing the last gap to full attention without runtime or memory unpredictability.
 - **Major deployment win**: Per-head quotas are fixed at inference time. No input can trigger extra memory use. VRAM and speed are 100% auditable.
-- **Best for practical LLM deployment**: If you want unbeatable accuracy with exact memory control, MATRIX-KV is the new SOTA.
+- **Best for practical LLM deployment**: If you want unbeatable accuracy with exact memory control, Matrix-KV is the new SOTA.
 
 
 ### Get Started

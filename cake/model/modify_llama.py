@@ -46,13 +46,17 @@ def llama_attn_forward_cake(
         )
     if isinstance(past_key_value, DynamicCache):
         past_key_value = CakeCache.from_dynamic_cache(past_key_value)
-    if self.config.decoding_evict[self.layer_idx] is None and len(past_key_value.layer_budget) == self.config.prefill_cake_evict[self.layer_idx].num_layers:
-        self.config.decoding_evict[self.layer_idx] =CakeDecodingKVCache_LayerWise(
-                hh_size =past_key_value.layer_budget[self.layer_idx],
-                window_size=self.config.window_size[self.layer_idx],
-                k_seq_dim=2,
-                v_seq_dim=2
-                )
+    
+    # Initialize decoding eviction cache when budgets are available
+    if (self.config.decoding_evict[self.layer_idx] is None and 
+        hasattr(past_key_value, 'layer_budget') and 
+        len(past_key_value.layer_budget) > self.layer_idx):
+        self.config.decoding_evict[self.layer_idx] = CakeDecodingKVCache_LayerWise(
+            hh_size=past_key_value.layer_budget[self.layer_idx],
+            window_size=self.config.window_size[self.layer_idx],
+            k_seq_dim=2,
+            v_seq_dim=2
+        )
     output_attentions = False
 
     bsz, q_len, _ = hidden_states.size()
@@ -98,54 +102,51 @@ def llama_attn_forward_cake(
 
     if self.config.prefill[self.layer_idx]:
         is_prefill = True
-        tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
-        if q_len !=1:
-
-            mask = torch.full((self.config.window_size[self.layer_idx], self.config.window_size[self.layer_idx]), torch.finfo(tmp_attn_weights.dtype).min, device=tmp_attn_weights.device)
-            mask_cond = torch.arange(mask.size(-1), device=tmp_attn_weights.device)
-            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-            mask = mask.to(tmp_attn_weights.device)
-            tmp_attention_mask = mask[None, None, :, :]
-
-            tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, -self.config.window_size[self.layer_idx]:] += tmp_attention_mask
-
-        tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float64)
-    
-        attn_focus = tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, :-self.config.window_size[self.layer_idx]]  # [B, H, W, L]
-
-        entropy = -torch.sum(attn_focus * torch.log(attn_focus + 1e-10), dim=-1)  # [B, H, W]
-        entropy_per_head = entropy.mean(dim=(0, 2))  # [H]
-
-        variance_per_head = attn_focus.var(dim=-1).mean(dim=(0, 2))  # [H]
-        entropy_per_head = torch.nan_to_num(entropy_per_head, nan=0.0, posinf=0.0, neginf=0.0)
-        variance_per_head = torch.nan_to_num(variance_per_head, nan=0.0, posinf=0.0, neginf=0.0)
-
-        pref_score_per_head = (entropy_per_head ** (1 / self.config.tau1)) * (variance_per_head ** (1 / self.config.tau2))
-        pref_score_per_head = torch.nan_to_num(pref_score_per_head, nan=0.0, posinf=0.0, neginf=0.0)
-        # print("Preference score calculated.")
-
-        # print(f"[CAKE] Layer {self.layer_idx} | pref_score_per_head shape = {pref_score_per_head.shape}")
-        # print(f"[CAKE] Layer {self.layer_idx} | pref_score_per_head sample = {pref_score_per_head[:5].detach().cpu().numpy()}")
-
-        #compute preference score and hh score
-        attention_score = tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, :] 
-
-        attn_mean = attention_score.mean(dim = -2)
-        attn_var = attention_score.var(dim = -2)
-        attn_cache = attn_mean + self.config.gamma * attn_var
-        attn_cache = attn_cache[:, :, :-self.config.window_size[self.layer_idx]]
-        attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=5//2, stride=1)
-        # attn_cache = attn_cache.reshape(bsz, self.num_key_value_heads, self.num_key_value_groups, -1)
-        # hh_score = attn_cache.mean(dim=-2)
-        hh_score = attn_cache
-        hh_score = torch.nan_to_num(hh_score, nan=0.0, posinf=0.0, neginf=0.0)
+        # Initialize budgets on first prefill layer if not done yet
+        if past_key_value.head_budgets is None and hasattr(self.config, 'head_budgets'):
+            past_key_value.initialize_budgets(self.config.head_budgets)
+            
+            # Check sequence length to determine if eviction is needed
+            total_seq_len = past_key_value.get_seq_length() + q_len
+            if total_seq_len <= self.config.cache_size + self.config.window_size[self.layer_idx]:
+                past_key_value.turn_off_eviction = True
+                print(f"[CAKE] Sequence length {total_seq_len} <= cache limit, eviction disabled")
+            else:
+                past_key_value.turn_off_eviction = False
+                print(f"[CAKE] Sequence length {total_seq_len} > cache limit, eviction enabled")
         
-        past_key_value.update_score(pref_score_per_head, hh_score)
-        # layer_logs[self.layer_idx]["attn_heatmap"].append(attn_for_heatmap)
-        past_key_value.layer_budget.append(self.config.key_size[self.layer_idx])
-        self.config.prefill[self.layer_idx] =False
-        past_key_value = self.config.prefill_cake_evict[self.layer_idx](past_key_value, q_len)
+        # For static allocation, we don't need to compute actual pref_scores
+        # Just create dummy pref_scores with the correct shape for compatibility
+        # num_heads = self.num_heads
+        # dummy_pref_score = torch.ones(num_heads, device=query_states.device, dtype=torch.float32)
+        
+        # # We still need hh_score for decoding phase, so compute minimal attention weights
+        # tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # if q_len != 1:
+        #     mask = torch.full((self.config.window_size[self.layer_idx], self.config.window_size[self.layer_idx]), torch.finfo(tmp_attn_weights.dtype).min, device=tmp_attn_weights.device)
+        #     mask_cond = torch.arange(mask.size(-1), device=tmp_attn_weights.device)
+        #     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        #     mask = mask.to(tmp_attn_weights.device)
+        #     tmp_attention_mask = mask[None, None, :, :]
+        #     tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, -self.config.window_size[self.layer_idx]:] += tmp_attention_mask
+
+        # tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float64)
+        
+        # # Compute hh_score for decoding phase
+        # attention_score = tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, :] 
+        # attn_mean = attention_score.mean(dim = -2)
+        # attn_var = attention_score.var(dim = -2)
+        # attn_cache = attn_mean + self.config.gamma * attn_var
+        # attn_cache = attn_cache[:, :, :-self.config.window_size[self.layer_idx]]
+        # attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=5//2, stride=1)
+        # hh_score = attn_cache
+        # hh_score = torch.nan_to_num(hh_score, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # # Update with dummy pref_score (only shape matters for static allocation)
+        # past_key_value.update_score(dummy_pref_score, hh_score)
+        self.config.prefill[self.layer_idx] = False
     
     if self.config.decoding_evict[self.layer_idx] is not None:
         # print the KV cache shapes after prefill and before eviction

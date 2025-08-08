@@ -24,6 +24,8 @@ class CakeCache(Cache):
         self.pref_scores = []
         self.evict_scores = []
         self.layer_budget = []
+        self.head_budgets = None  # Will store pre-computed head budgets
+        self.turn_off_eviction = True  # Default to True, will be set by prefill logic
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
         Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
@@ -93,6 +95,16 @@ class CakeCache(Cache):
     ):
         self.pref_scores.append(pref_score)
         self.evict_scores.append(evict_score)
+
+    def initialize_budgets(self, head_budgets: Dict[int, List[int]]):
+        """Initialize pre-computed budgets for static allocation"""
+        self.head_budgets = head_budgets
+        self.layer_budget = []
+        for layer_idx in sorted(head_budgets.keys()):
+            layer_budget = sum(head_budgets[layer_idx])
+            self.layer_budget.append(layer_budget)
+        print(f"[CAKE] Initialized budgets for {len(self.layer_budget)} layers: {self.layer_budget}")
+        self.turn_off_eviction = False
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
@@ -178,8 +190,8 @@ class CakeCache(Cache):
             layer_keys = torch.cat([current.key_cache[idx] for current in splits], dim=0)
             layer_values = torch.cat([current.value_cache[idx] for current in splits], dim=0)
             cache.update(layer_keys, layer_values, idx)
-            cache.pref_scores = self.pref_scores
-            cache.evict_scores = self.evict_scores
+            cache.pref_scores = splits[0].pref_scores
+            cache.evict_scores = splits[0].evict_scores
         return cache
 
     def batch_repeat_interleave(self, repeats: int):
@@ -207,84 +219,37 @@ class CakeprefillKVCache:
         num_layers = 32,
         use_cascading = False,
         config=None,
-        model_layers=None
+        model_layers=None,
+        precomputed_head_budgets=None  # NEW: Pre-computed budgets
     ):
 
         self.window_size = window_size
-        self.total_size = (cache_size-window_size) * num_layers * num_heads # might have to change
         self.cache_size = cache_size
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.use_cascading = use_cascading  # If true, ensure high attention precision
-        # Although the cascading came with CAKE, I have not used it here. 
+        self.use_cascading = use_cascading
         self.config = config
         self.model_layers = model_layers
-        # print(f"CakeprefillKVCache: {self.total_size}, {self.window_size}")
+        # Store pre-computed budgets instead of calculating them every time
+        self.precomputed_head_budgets = precomputed_head_budgets
+        print(f"[CAKE] CakeprefillKVCache initialized with pre-computed budgets: {precomputed_head_budgets is not None}")
 
     def __call__(self, past_key_values, seq_len):
-        if seq_len<=self.cache_size+self.window_size:
+        if seq_len <= self.cache_size + self.window_size:
             past_key_values.turn_off_eviction = True
             return past_key_values
 
-        past_key_values.turn_off_eviction = False
-        pref_scores = past_key_values.pref_scores
-        # print(f"[CAKE] Pref Scores: {pref_scores}")
-        head_budgets = compute_head_budgets_dynamic(
-            pref_scores,
-            self.total_size,
-            # allocation_strategy="entropy_based",
-            allocation_strategy="static",
-            max_seq_len=self.cache_size
-        )
-        # Store head budgets in the CakeCache object
-        past_key_values.head_budgets = head_budgets
-        # print(f"[CAKE] Head Budgets: {head_budgets}")
-        for layer_idx in head_budgets:
-            # print(f"[CAKE] Layer {layer_idx} Head Budget: {head_budgets[layer_idx]}")
-            layer_budget = sum(head_budgets[layer_idx])
-            past_key_values.layer_budget[layer_idx] = layer_budget
-            
-
+        # Use pre-computed budgets instead of calculating them
+        if self.precomputed_head_budgets is None:
+            raise ValueError("No pre-computed head budgets available! Make sure to call precompute_static_head_budgets during model initialization.")
         
-        # print(f"[CAKE] Head Budgets: {past_key_values.head_budgets}")
-        # print(f"[CAKE] Stored head_budgets in past_key_values: {head_budgets}")
-        # for layer_idx in head_budgets:
-        #     past_key_values = self.evict_kvcache_headwise(
-        #         past_key_values,
-        #         layer_idx,
-        #         head_budgets[layer_idx],
-        #         self.window_size
-        #     )
-        #     past_key_values.layer_budget[layer_idx] = sum(head_budgets[layer_idx])
-
-        # head_budgets = compute_head_budgets(evict_scores, total_budget=self.total_size, window_size=self.window_size)
-
-  
-        # layer_budgets = [pref_score/sum(pref_scores)*self.total_size for pref_score in pref_scores]
-    
-        # layer_budgets = adjust_budgets(layer_budgets, self.total_size, seq_len-self.window_size,  self.num_layers)
-
-        # if self.use_cascading:
-        #     layer_idx = 0
-        #     print(layer_budgets)
-        #     for budget in layer_budgets:
-        #         if budget>= seq_len-self.window_size:
-        #             budget = seq_len-self.window_size
-        #         past_key_values = self.evcit_layer_kvcache(past_key_values, layer_idx, budget)
-        #         past_key_values.layer_budget[layer_idx]=budget
-        #         layer_idx +=1
-        # else:
-        #     layer_idx = 0
-        #     if len(layer_budgets) ==self.num_layers:
-        #         for budget in layer_budgets:
-        #             if budget>= seq_len-self.window_size:
-        #                 budget = seq_len-self.window_size
-        #             past_key_values = self.evcit_layer_kvcache(past_key_values, layer_idx, budget)
-        #             past_key_values.layer_budget[layer_idx]=budget
-        #             layer_idx +=1
-
+        # Initialize budgets in the cache if not already done
+        if past_key_values.head_budgets is None:
+            past_key_values.initialize_budgets(self.precomputed_head_budgets)
+            
+        print(f"[CAKE] Using pre-computed budgets, total layers: {len(self.precomputed_head_budgets)}")
         return past_key_values
 
 class CakeDecodingKVCache_LayerWise:

@@ -2,8 +2,8 @@
 from transformers import AutoModelForCausalLM
 import torch
 models_to_cache = [
-    "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.3"
+    "meta-llama/Llama-2-7b-chat-hf",
+    "meta-llama/Llama-2-13b-chat-hf"
 ]
 
 for model_name in models_to_cache:

@@ -14,8 +14,7 @@ import torch.multiprocessing as mp
 import sys
 from pathlib import Path
 
-from cake.cake_cache import CakeprefillKVCache 
-from cake.utils import CompressConfig 
+from cake.utils import CompressConfig, precompute_static_head_budgets 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -205,6 +204,26 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
         layers = config.num_hidden_layers
 
     if compress_config.compress:
+        # Get correct model dimensions from config
+        num_heads = config.num_attention_heads
+        print(f"[CAKE] Model config: {layers} layers, {num_heads} heads per layer")
+        
+        # Pre-compute head budgets once before setting up layers
+        print(f"[CAKE] Pre-computing head budgets for {layers} layers...")
+        head_budgets = precompute_static_head_budgets(
+            cache_size=compress_config.cache_size,
+            window_size=compress_config.window_size,
+            num_layers=layers,
+            num_heads=num_heads,
+            importance_file_path="./importance_scores/meta_llama_Meta_Llama_3.1_8B_Instruct_importance.npy"
+        )
+
+        print(head_budgets)
+
+        # Store budgets in compress_config for later access
+        compress_config.head_budgets = head_budgets
+        compress_config.layer_budgets = {layer_idx: sum(budgets) for layer_idx, budgets in head_budgets.items()}
+        
         for i in range(layers):
             model.model.layers[i].self_attn.config.key_size = [compress_config.cache_size - compress_config.window_size]*layers
             model.model.layers[i].self_attn.config.window_size = [compress_config.window_size]*layers
@@ -213,15 +232,9 @@ def load_model_and_tokenizer(path, model_name, device, compress_config):
             model.model.layers[i].self_attn.config.tau1 = compress_config.hyper[0]
             model.model.layers[i].self_attn.config.tau2 = compress_config.hyper[1] 
             model.model.layers[i].self_attn.config.gamma = compress_config.hyper[2] 
-            model.model.layers[i].self_attn.config.prefill_cake_evict = [CakeprefillKVCache(
-                cache_size=compress_config.cache_size,
-                window_size=compress_config.window_size,
-                k_seq_dim=2,
-                v_seq_dim=2,
-                num_heads=model.model.layers[i].self_attn.num_heads,
-                num_layers=layers,
-                use_cascading=compress_config.cascading
-            )]*layers
+            # Store head budgets directly in config instead of creating CakeprefillKVCache
+            model.model.layers[i].self_attn.config.head_budgets = head_budgets
+            model.model.layers[i].self_attn.config.cache_size = compress_config.cache_size
 
     model = model.eval()
 

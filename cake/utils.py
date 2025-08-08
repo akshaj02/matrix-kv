@@ -10,12 +10,115 @@ class CompressConfig:
         self.cache_size = cache_size
         self.window_size = window_size
         self.hyper = hyper
-        self.allocation_strategy = allocation_strategy  # NEW
-        self.head_budgets = None 
+        self.allocation_strategy = allocation_strategy
+        self.head_budgets = None  # Will store pre-computed budgets
+        self.layer_budgets = None  # Will store layer-level budgets 
     
     def __str__(self):
         return f"Config(cache_size={self.cache_size}, window_size={self.window_size}, " \
                f"allocation={self.allocation_strategy}, hyper={self.hyper})"
+
+
+def precompute_static_head_budgets(
+    cache_size: int, 
+    window_size: int, 
+    num_layers: int, 
+    num_heads: int,
+    importance_file_path: str = "./importance_scores/meta_llama_Meta_Llama_3.1_8B_Instruct_importance.npy"
+) -> Dict[int, List[int]]:
+    """
+    Pre-compute head budgets for all layers based on static importance scores.
+    This function should be called once during model initialization.
+    
+    Args:
+        cache_size: Total cache size (e.g., 1024)
+        window_size: Window size to keep recent tokens (e.g., 32)  
+        num_layers: Number of transformer layers
+        num_heads: Number of attention heads per layer
+        importance_file_path: Path to the .npy file with importance scores
+        
+    Returns:
+        Dict[layer_idx] = List[head_budgets] for each layer
+    """
+    print(f"[CAKE] Pre-computing static head budgets from {importance_file_path}")
+    
+    # Load importance scores once
+    importance_scores = np.load(importance_file_path)
+    importance_scores = torch.from_numpy(importance_scores)
+    
+    # Validate dimensions
+    expected_shape = (num_layers, num_heads)
+    if importance_scores.shape != expected_shape:
+        raise ValueError(f"Importance scores shape {importance_scores.shape} doesn't match expected {expected_shape}")
+    
+    # Calculate total budget
+    total_budget = (cache_size - window_size) * num_layers * num_heads
+    max_seq_len = cache_size
+    
+    # Flatten scores and compute allocation weights
+    flat_importance = importance_scores.flatten()  # shape: [L * H]
+    allocation_weights = flat_importance / flat_importance.sum()
+    
+    # Compute raw budgets
+    raw_budgets = (allocation_weights * total_budget).long()
+    
+    # Ensure minimum budget per head
+    min_importance = flat_importance.min()
+    min_weight = min_importance / flat_importance.sum()
+    min_budget_per_head = max(1, int(min_weight * total_budget))
+    total_heads = len(flat_importance)
+    min_total = min_budget_per_head * total_heads
+    
+    if total_budget < min_total:
+        # If total budget is too small, scale down proportionally
+        scale_factor = total_budget / min_total
+        raw_budgets = (flat_importance / flat_importance.sum() * total_budget * scale_factor).long()
+        raw_budgets = torch.maximum(raw_budgets, torch.tensor(1))
+    else:
+        raw_budgets = torch.maximum(raw_budgets, torch.tensor(min_budget_per_head))
+        
+        # Clamp budgets to max_seq_len
+        raw_budgets = torch.minimum(raw_budgets, torch.tensor(max_seq_len))
+        
+        # Adjust to meet total budget constraint after clamping
+        current_total = raw_budgets.sum()
+        budget_diff = total_budget - current_total
+        
+        if budget_diff != 0:
+            importance_order = torch.argsort(flat_importance)
+            
+            if budget_diff > 0:
+                # Add extra budget to most important heads that aren't at max limit
+                available_mask = raw_budgets < max_seq_len
+                available_indices = torch.where(available_mask)[0]
+                
+                if len(available_indices) > 0:
+                    available_importance = flat_importance[available_indices]
+                    sorted_indices = torch.argsort(available_importance, descending=True)
+                    available_by_importance = available_indices[sorted_indices]
+                    
+                    for i in range(min(budget_diff, len(available_by_importance))):
+                        raw_budgets[available_by_importance[i]] += 1
+                        
+            else:  # budget_diff < 0
+                # Remove budget from least important heads
+                for i in range(min(abs(budget_diff), total_heads)):
+                    head_idx = importance_order[i]
+                    if raw_budgets[head_idx] > min_budget_per_head:
+                        raw_budgets[head_idx] -= 1
+    
+    # Convert back to per-layer format
+    head_budgets = {}
+    for layer_idx in range(num_layers):
+        start_idx = layer_idx * num_heads
+        end_idx = start_idx + num_heads
+        layer_budgets = raw_budgets[start_idx:end_idx].tolist()
+        head_budgets[layer_idx] = layer_budgets
+    
+    print(f"[CAKE] Pre-computed budgets for {num_layers} layers, {num_heads} heads each")
+    print(f"[CAKE] Total budget: {total_budget}, Actual allocated: {sum(sum(budgets) for budgets in head_budgets.values())}")
+    
+    return head_budgets
 
 
 def calculate_entropy(attention_scores):
@@ -141,7 +244,7 @@ def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: 
 
         min_importance = flat_importance.min()
         # print(f"[CAKE] Min Importance: {min_importance}")
-        max_importance = flat_importance.max()
+        # max_importance = flat_importance.max()
         # print(f"[CAKE] Max Importance: {max_importance}")
         total_heads = len(flat_importance)
         
@@ -150,13 +253,13 @@ def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: 
         # print(f"[CAKE] Allocation Weights: {allocation_weights}")
         min_weight = min_importance / flat_importance.sum()
         # print(f"[CAKE] Min Weight: {min_weight}")
-        max_weight = max_importance / flat_importance.sum()
+        # max_weight = max_importance / flat_importance.sum()
         # print(f"[CAKE] Max Weight: {max_weight}")
         # almost always it will be more than 1
         min_budget_per_head = max(1, int(min_weight * total_budget))
         # print(f"[CAKE] Min Budget Per Head: {min_budget_per_head}")
 
-        max_budget_per_head = max(1, int(max_weight * total_budget))
+        # max_budget_per_head = max(1, int(max_weight * total_budget))
         # print(f"[CAKE] Max Budget Per Head: {max_budget_per_head}")
 
         raw_budgets = (allocation_weights * total_budget).long()  # shape: [L * H]

@@ -51,13 +51,16 @@ def mistral_attn_forward_cake(
         )
     if isinstance(past_key_value, DynamicCache):
         past_key_value = CakeCache.from_dynamic_cache(past_key_value)
-    if self.config.decoding_evict[self.layer_idx] is None and len(past_key_value.layer_budget) == self.config.prefill_cake_evict[self.layer_idx].num_layers:
-        self.config.decoding_evict[self.layer_idx] =CakeDecodingKVCache_LayerWise(
-                hh_size =past_key_value.layer_budget[self.layer_idx],
-                window_size=self.config.window_size[self.layer_idx],
-                k_seq_dim=2,
-                v_seq_dim=2
-                )
+    # Initialize decoding eviction cache when budgets are available
+    if (self.config.decoding_evict[self.layer_idx] is None and 
+        hasattr(past_key_value, 'layer_budget') and 
+        len(past_key_value.layer_budget) > self.layer_idx):
+        self.config.decoding_evict[self.layer_idx] = CakeDecodingKVCache_LayerWise(
+            hh_size=past_key_value.layer_budget[self.layer_idx],
+            window_size=self.config.window_size[self.layer_idx],
+            k_seq_dim=2,
+            v_seq_dim=2
+        )
 
     output_attentions = False
 
@@ -145,9 +148,10 @@ def mistral_attn_forward_cake(
         past_key_value.update_score(pref_score, hh_score)
 
 
-        past_key_value.layer_budget.append(self.config.key_size[self.layer_idx])
-        self.config.prefill[self.layer_idx] =False
-        past_key_value = self.config.prefill_cake_evict[self.layer_idx](past_key_value, q_len)
+        # Budget initialization is now handled in the attention forward pass
+        # past_key_value.layer_budget.append(self.config.key_size[self.layer_idx])
+        self.config.prefill[self.layer_idx] = False
+        # No longer need to call prefill_cake_evict - budgets are pre-computed
 
 
     # if self.config.decoding_evict[self.layer_idx] is not None:

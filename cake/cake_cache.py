@@ -4,6 +4,8 @@ from torch import nn
 import numpy as np
 from transformers.cache_utils import DynamicCache, Cache, HybridCache
 from typing import Any, Dict, List, Optional, Tuple, Union
+import time
+import json
 
 from cake.utils import adjust_budgets, compute_head_budgets, compute_head_budgets_dynamic
 from datetime import datetime
@@ -103,7 +105,7 @@ class CakeCache(Cache):
         for layer_idx in sorted(head_budgets.keys()):
             layer_budget = sum(head_budgets[layer_idx])
             self.layer_budget.append(layer_budget)
-        print(f"[CAKE] Initialized budgets for {len(self.layer_budget)} layers: {self.layer_budget}")
+        # print(f"[CAKE] Initialized budgets for {len(self.layer_budget)} layers: {self.layer_budget}")
         self.turn_off_eviction = False
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
@@ -234,7 +236,7 @@ class CakeprefillKVCache:
         self.model_layers = model_layers
         # Store pre-computed budgets instead of calculating them every time
         self.precomputed_head_budgets = precomputed_head_budgets
-        print(f"[CAKE] CakeprefillKVCache initialized with pre-computed budgets: {precomputed_head_budgets is not None}")
+        # print(f"[CAKE] CakeprefillKVCache initialized with pre-computed budgets: {precomputed_head_budgets is not None}")
 
     def __call__(self, past_key_values, seq_len):
         if seq_len <= self.cache_size + self.window_size:
@@ -249,8 +251,126 @@ class CakeprefillKVCache:
         if past_key_values.head_budgets is None:
             past_key_values.initialize_budgets(self.precomputed_head_budgets)
             
-        print(f"[CAKE] Using pre-computed budgets, total layers: {len(self.precomputed_head_budgets)}")
+        # print(f"[CAKE] Using pre-computed budgets, total layers: {len(self.precomputed_head_budgets)}")
         return past_key_values
+
+# class CakeDecodingKVCache_LayerWise:
+#     def __init__(
+#         self,
+#         hh_size=128,
+#         window_size=32,
+#         k_seq_dim=2,
+#         v_seq_dim=2,
+
+#     ):
+#         # print(f"CakeDecodingKVCache_LayerWise: {hh_size}, {window_size}")
+#         self.hh_size = hh_size
+#         self.window_size = window_size
+#         self.cache_size = hh_size + window_size
+#         self.k_seq_dim = k_seq_dim
+#         self.v_seq_dim = v_seq_dim
+#         self.hh_score = None
+
+
+#     def __call__(self, past_key_values, attn_score_cache, layer_idx, head_budgets):
+#         # print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
+
+
+
+#         num_heads = attn_score_cache.shape[1]  # query heads, 32
+#         bsz, num_kv_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
+#         device = past_key_values.key_cache[layer_idx].device
+#         num_groups = num_heads // num_kv_heads  # typically 4
+
+#         if seq_len <= self.cache_size:
+#             print(f"[CAKE] Layer {layer_idx} seq_len ({seq_len}) <= cache_size ({self.cache_size}), skipping eviction.")
+#             return past_key_values
+
+#         # Step 1: Reduce scores to per-head values (mean over query)
+#         attn_cache = attn_score_cache[:, :, :, :-self.window_size].mean(dim=-2)  # [B, 32, S-window]
+
+#         # Step 2: Smooth scores with avg pooling
+#         attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=2, stride=1)
+
+#         # Step 3: Reshape to KV head grouping
+#         attn_cache = attn_cache.reshape(bsz, num_kv_heads, num_groups, -1)  # [B, 8, 4, S]
+#         attn_cache = attn_cache.mean(dim=2)  # [B, 8, S] — 1 score per KV head
+
+#         # Step 4: Group budgets from 32 heads → 8 KV heads
+#         if len(head_budgets) == 32 and num_kv_heads == 8:
+#             head_budgets_grouped = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
+#         else:
+#             head_budgets_grouped = head_budgets
+
+#         # head_budgets_grouped = [sum(head_budgets[i*4:(i+1)*4]) for i in range(num_kv_heads)]  # [8]
+
+#         # Step 5: Get indices per KV head
+#         max_k = max([max(k, self.window_size) for k in head_budgets_grouped])
+#         print(f"[CAKE] For layer {layer_idx}, max_k (for padding): {max_k}")
+        
+#         new_key_cache = []
+#         new_value_cache = []
+
+#         # Past cache excluding window
+#         past_kv_len = seq_len - self.window_size
+#         key_past = past_key_values.key_cache[layer_idx][:, :, :past_kv_len, :]  # [B, H, S-w, D]
+#         value_past = past_key_values.value_cache[layer_idx][:, :, :past_kv_len, :]
+
+#         total_padded_tokens = 0
+
+#         for h in range(num_kv_heads):
+#             k = max(head_budgets_grouped[h], self.window_size)
+
+#             # Top-k indices for head h
+#             scores = attn_cache[:, h, :]  # [B, S-window]
+#             topk_indices = scores.topk(k, dim=-1).indices  # [B, k]
+#             topk_indices = topk_indices.unsqueeze(-1).expand(-1, -1, head_dim)  # [B, k, D]
+
+#             # Gather K/V tokens for this head
+#             key_sel = key_past[:, h].gather(dim=1, index=topk_indices)  # [B, k, D]
+#             value_sel = value_past[:, h].gather(dim=1, index=topk_indices)
+
+#             # print the shapes of selected keys and values
+#             print(f"[CAKE] Layer {layer_idx}, Head {h}: Selected key shape: {key_sel.shape}, Selected value shape: {value_sel.shape}")
+
+#             # Pad if needed
+#             pad_len = max_k - k
+#             if pad_len > 0:
+#                 total_padded_tokens += pad_len
+#                 pad_shape = (bsz, pad_len, head_dim)
+#                 eps = 1e-6
+#                 key_pad = torch.full(pad_shape, eps, device=device, dtype=key_sel.dtype)
+#                 value_pad = torch.full(pad_shape, eps, device=device, dtype=value_sel.dtype)
+
+#                 key_sel = torch.cat([key_pad, key_sel], dim=1)  # [B, max_k, D]
+#                 value_sel = torch.cat([value_pad, value_sel], dim=1)
+
+#             print(f"[CAKE] Layer {layer_idx}, Head {h}: After padding, key shape: {key_sel.shape}, value shape: {value_sel.shape}")
+#             new_key_cache.append(key_sel)
+#             new_value_cache.append(value_sel)
+
+#         # Stack across heads: [B, H, max_k, D]
+#         key_compressed = torch.stack(new_key_cache, dim=1)
+#         value_compressed = torch.stack(new_value_cache, dim=1)
+
+#         print(f"[CAKE] Layer {layer_idx}: Total padded positions this eviction: {total_padded_tokens}")
+
+#         # Keep the current window (last W tokens)
+#         key_window = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]
+#         value_window = past_key_values.value_cache[layer_idx][:, :, -self.window_size:, :]
+
+#         # Concatenate compressed + window → final [B, H, max_k + W, D]
+#         key_final = torch.cat([key_compressed, key_window], dim=2)
+#         value_final = torch.cat([value_compressed, value_window], dim=2)
+
+#         # Update cache
+#         past_key_values.key_cache[layer_idx] = key_final
+#         past_key_values.value_cache[layer_idx] = value_final
+
+#         print("[CAKE] After eviction, key cache shape:", key_final.shape)
+#         print("[CAKE] After eviction, value cache shape:", value_final.shape)
+
+#         return past_key_values
 
 class CakeDecodingKVCache_LayerWise:
     def __init__(
@@ -261,7 +381,12 @@ class CakeDecodingKVCache_LayerWise:
         v_seq_dim=2,
 
     ):
-        # print(f"CakeDecodingKVCache_LayerWise: {hh_size}, {window_size}")
+        # # Fix: ensure hh_size is an integer
+        # if isinstance(hh_size, (list, tuple)):
+        #     self.hh_size = hh_size[0] if len(hh_size) > 0 else 128
+        # else:
+        #     self.hh_size = hh_size
+
         self.hh_size = hh_size
         self.window_size = window_size
         self.cache_size = hh_size + window_size
@@ -269,21 +394,83 @@ class CakeDecodingKVCache_LayerWise:
         self.v_seq_dim = v_seq_dim
         self.hh_score = None
 
-
-    def __call__(self, past_key_values, attn_score_cache, layer_idx, head_budgets):
+    def __call__(self, past_key_values, attn_score_cache, layer_idx, head_budgets, query_states):
+        eviction_start_time = time.time()
+        eviction_timing = {}
+        
         # print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
-
-
 
         num_heads = attn_score_cache.shape[1]  # query heads, 32
         bsz, num_kv_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
         device = past_key_values.key_cache[layer_idx].device
         num_groups = num_heads // num_kv_heads  # typically 4
 
-        if seq_len <= self.cache_size:
-            print(f"[CAKE] Layer {layer_idx} seq_len ({seq_len}) <= cache_size ({self.cache_size}), skipping eviction.")
-            return past_key_values
+        # if seq_len <= self.cache_size:
+        #     # print("Skipping eviction")
+        #     # print(f"[CAKE] Layer {layer_idx} seq_len ({seq_len}) <= cache_size ({self.cache_size}), skipping eviction.")
+        #     B, H, Q, D = query_states.shape
+        #     device = past_key_values.key_cache[layer_idx].device
+        #     # Query for varlen (typically Q=1 for decoding)
+        #     q_varlen = query_states.transpose(1, 2).reshape(B * Q, H, D)  # (B*Q, H, D)
+        #     # All K,V tokens (no selection needed)
+        #     k_varlen = past_key_values.key_cache[layer_idx].transpose(1, 2).reshape(-1, past_key_values.key_cache[layer_idx].shape[1], D)  # (B*S, H_kv, D)
+        #     v_varlen = past_key_values.value_cache[layer_idx].transpose(1, 2).reshape(-1, past_key_values.value_cache[layer_idx].shape[1], D)  # (B*S, H_kv, D)
+            
+        #     # Cumulative sequence lengths
+        #     cu_seqlens_q = torch.arange(0, (B + 1) * Q, Q, dtype=torch.int32, device=device)
+        #     cu_seqlens_k = torch.arange(0, (B + 1) * seq_len, seq_len, dtype=torch.int32, device=device)
+            
+        #     max_seqlen_q = Q
+        #     max_seqlen_k = seq_len
+            
+        #     return past_key_values, q_varlen, k_varlen, v_varlen, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
 
+        if seq_len <= self.cache_size:
+
+            # print(f"\n=== DEBUG NO EVICTION LAYER {layer_idx} ===")
+            # print(f"seq_len ({seq_len}) <= cache_size ({self.cache_size}), skipping eviction")
+            
+            B, H, Q, D = query_states.shape
+            device = past_key_values.key_cache[layer_idx].device
+            
+            # print(f"Input shapes - B:{B}, H:{H}, Q:{Q}, D:{D}")
+            # print(f"KV cache shape: {past_key_values.key_cache[layer_idx].shape}")
+            # print(f"seq_len: {seq_len}, window_size: {self.window_size}")
+            
+            # Query for varlen (typically Q=1 for decoding)
+            q_varlen = query_states.transpose(1, 2).reshape(B * Q, H, D)  # (B*Q, H, D)
+            # print(f"q_varlen shape: {q_varlen.shape}")
+            
+            # All K,V tokens (no selection needed)
+            k_varlen = past_key_values.key_cache[layer_idx].transpose(1, 2).reshape(-1, past_key_values.key_cache[layer_idx].shape[1], D)  # (B*S, H_kv, D)
+            v_varlen = past_key_values.value_cache[layer_idx].transpose(1, 2).reshape(-1, past_key_values.value_cache[layer_idx].shape[1], D)  # (B*S, H_kv, D)
+            
+            # print(f"k_varlen shape: {k_varlen.shape}")
+            # print(f"v_varlen shape: {v_varlen.shape}")
+            
+            # Check for any NaN or inf values
+            if torch.isnan(k_varlen).any():
+                print("WARNING: NaN values found in k_varlen!")
+            if torch.isinf(k_varlen).any():
+                print("WARNING: Inf values found in k_varlen!")
+            
+            # Cumulative sequence lengths
+            cu_seqlens_q = torch.arange(0, (B + 1) * Q, Q, dtype=torch.int32, device=device)
+            cu_seqlens_k = torch.arange(0, (B + 1) * seq_len, seq_len, dtype=torch.int32, device=device)
+            
+            max_seqlen_q = Q
+            max_seqlen_k = seq_len
+            
+            # print(f"Metadata:")
+            # print(f"  cu_seqlens_q: {cu_seqlens_q}")
+            # print(f"  cu_seqlens_k: {cu_seqlens_k}")
+            # print(f"  max_seqlen_q: {max_seqlen_q}")
+            # print(f"  max_seqlen_k: {max_seqlen_k}")
+            # print(f"=== END NO EVICTION DEBUG ===\n")
+            
+            return past_key_values, q_varlen, k_varlen, v_varlen, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+        # Timing: Score processing
+        score_start = time.time()
         # Step 1: Reduce scores to per-head values (mean over query)
         attn_cache = attn_score_cache[:, :, :, :-self.window_size].mean(dim=-2)  # [B, 32, S-window]
 
@@ -291,90 +478,252 @@ class CakeDecodingKVCache_LayerWise:
         attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=2, stride=1)
 
         # Step 3: Reshape to KV head grouping
-        attn_cache = attn_cache.reshape(bsz, num_kv_heads, num_groups, -1)  # [B, 8, 4, S]
-        attn_cache = attn_cache.mean(dim=2)  # [B, 8, S] — 1 score per KV head
+        # attn_cache = attn_cache.reshape(bsz, num_kv_heads, num_groups, -1)  # [B, 8, 4, S]
+        # attn_cache = attn_cache.mean(dim=2)  # [B, 8, S] — 1 score per KV head
 
+        attn_cache = attn_cache.view(bsz, num_kv_heads, num_groups, -1).mean(dim=2)
+        eviction_timing['score_processing'] = time.time() - score_start
+
+        # Timing: Budget grouping
+        budget_start = time.time()
         # Step 4: Group budgets from 32 heads → 8 KV heads
         if len(head_budgets) == 32 and num_kv_heads == 8:
             head_budgets_grouped = [sum(head_budgets[i*4:(i+1)*4]) for i in range(8)]
         else:
             head_budgets_grouped = head_budgets
-
-        # head_budgets_grouped = [sum(head_budgets[i*4:(i+1)*4]) for i in range(num_kv_heads)]  # [8]
-
-        # Step 5: Get indices per KV head
-        max_k = max([max(k, self.window_size) for k in head_budgets_grouped])
-        print(f"[CAKE] For layer {layer_idx}, max_k (for padding): {max_k}")
+        eviction_timing['budget_processing'] = time.time() - budget_start
         
-        new_key_cache = []
-        new_value_cache = []
 
+        # NEW: Prepare varlen flash attention inputs instead of padding
+        return self._prepare_varlen_inputs(
+            past_key_values, attn_cache, head_budgets_grouped, 
+            layer_idx, query_states, eviction_timing, eviction_start_time
+        )
+    
+    # def _prepare_varlen_inputs(self, past_key_values, attn_cache, head_budgets_grouped, 
+    #                          layer_idx, query_states, eviction_timing, eviction_start_time):
+    #     """
+    #     Prepare inputs for flash_attn_varlen_func without padding.
+    #     Returns: (past_key_values, varlen_data)
+    #     """
+    #     bsz, num_kv_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
+    #     device = past_key_values.key_cache[layer_idx].device
+    #     B, H, Q, D = query_states.shape
+        
+    #     # Timing: Varlen preparation
+    #     varlen_start = time.time()
+        
+    #     # Past cache excluding window
+    #     past_kv_len = seq_len - self.window_size
+    #     key_past = past_key_values.key_cache[layer_idx][:, :, :past_kv_len, :]  # [B, H_kv, S-w, D]
+    #     value_past = past_key_values.value_cache[layer_idx][:, :, :past_kv_len, :]
+    #     key_window = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]  # [B, H_kv, w, D]
+    #     value_window = past_key_values.value_cache[layer_idx][:, :, -self.window_size:, :]
+        
+    #     # Prepare query for varlen (typically Q=1 for decoding)
+    #     q_varlen = query_states.transpose(1, 2).reshape(B * Q, H, D)  # (B*Q, H, D)
+        
+    #     # Select K,V tokens per head without padding
+    #     selected_k_list = []
+    #     selected_v_list = []
+    #     cu_seqlens_k = [0]  # Cumulative sequence lengths for K/V
+        
+    #     for b in range(B):  # Usually B=1
+    #         total_selected = 0
+    #         for h_kv in range(num_kv_heads):
+    #             budget = max(head_budgets_grouped[h_kv], 0)
+                
+    #             if budget > 0:
+    #                 # Select top-k tokens from past (excluding window)
+    #                 scores = attn_cache[b, h_kv, :]  # [S-window]
+    #                 topk_indices = scores.topk(budget, dim=-1).indices  # [budget]
+                    
+    #                 # Gather selected tokens
+    #                 selected_k_past = key_past[b, h_kv, topk_indices, :]  # [budget, D]
+    #                 selected_v_past = value_past[b, h_kv, topk_indices, :]  # [budget, D]
+    #             else:
+    #                 # No tokens selected from past
+    #                 selected_k_past = torch.empty(0, head_dim, device=device, dtype=key_past.dtype)
+    #                 selected_v_past = torch.empty(0, head_dim, device=device, dtype=value_past.dtype)
+                
+    #             # Add window tokens (always keep these)
+    #             k_head_window = key_window[b, h_kv, :, :]  # [window, D]
+    #             v_head_window = value_window[b, h_kv, :, :]  # [window, D]
+                
+    #             # Concatenate selected + window for this head
+    #             k_head_total = torch.cat([selected_k_past, k_head_window], dim=0)  # [budget+window, D]
+    #             v_head_total = torch.cat([selected_v_past, v_head_window], dim=0)  # [budget+window, D]
+                
+    #             selected_k_list.append(k_head_total)
+    #             selected_v_list.append(v_head_total)
+    #             total_selected += len(k_head_total)
+            
+    #         cu_seqlens_k.append(cu_seqlens_k[-1] + total_selected)
+        
+    #     # Concatenate all selected K,V tokens across heads
+    #     k_varlen = torch.cat(selected_k_list, dim=0)  # (total_selected_k, D)
+    #     v_varlen = torch.cat(selected_v_list, dim=0)  # (total_selected_k, D)
+        
+    #     # Add head dimension back for compatibility with flash attention
+    #     k_varlen = k_varlen.unsqueeze(1).expand(-1, num_kv_heads, -1)  # (total_selected_k, H_kv, D)
+    #     v_varlen = v_varlen.unsqueeze(1).expand(-1, num_kv_heads, -1)  # (total_selected_k, H_kv, D)
+        
+    #     # Query cumulative lengths (simple for decoding)
+    #     cu_seqlens_q = torch.arange(0, (B + 1) * Q, Q, dtype=torch.int32, device=device)
+    #     cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
+        
+    #     max_seqlen_q = Q
+    #     max_seqlen_k = max(cu_seqlens_k[i+1] - cu_seqlens_k[i] for i in range(B)) if B > 0 else 0
+        
+    #     eviction_timing['varlen_preparation'] = time.time() - varlen_start
+    #     eviction_timing['total_eviction'] = time.time() - eviction_start_time
+    #     eviction_timing['total_selected_tokens'] = int(len(k_varlen))
+    #     eviction_timing['max_seqlen_k'] = int(max_seqlen_k)
+        
+    #     # Write eviction timing to file (convert any tensor values to Python types)
+    #     serializable_timing = {}
+    #     for key, value in eviction_timing.items():
+    #         if hasattr(value, 'item'):  # PyTorch tensor
+    #             serializable_timing[key] = value.item()
+    #         elif isinstance(value, (int, float, str, bool)):
+    #             serializable_timing[key] = value
+    #         else:
+    #             serializable_timing[key] = str(value)  # fallback to string
+        
+    #     with open(f"eviction_timing_layer_{layer_idx}.json", "a") as f:
+    #         f.write(json.dumps(serializable_timing) + '\n')
+        
+    #     # Return the 8 values that modify_llama.py expects
+    #     return past_key_values, q_varlen, k_varlen, v_varlen, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+    def _prepare_varlen_inputs(self, past_key_values, attn_cache, head_budgets_grouped, 
+                         layer_idx, query_states, eviction_timing, eviction_start_time):
+        """
+        Prepare inputs for flash_attn_varlen_func without padding.
+        Returns: (past_key_values, varlen_data)
+        """
+        bsz, num_kv_heads, seq_len, head_dim = past_key_values.key_cache[layer_idx].shape
+        device = past_key_values.key_cache[layer_idx].device
+        B, H, Q, D = query_states.shape
+        
+        # print(f"\n=== DEBUG EVICTION LAYER {layer_idx} ===")
+        # print(f"Input shapes - B:{B}, H:{H}, Q:{Q}, D:{D}")
+        # print(f"KV cache shape: {past_key_values.key_cache[layer_idx].shape}")
+        # print(f"seq_len: {seq_len}, window_size: {self.window_size}")
+        # print(f"head_budgets_grouped: {head_budgets_grouped}")
+        # print(f"attn_cache shape: {attn_cache.shape}")
+        
+        # Timing: Varlen preparation
+        varlen_start = time.time()
+        
         # Past cache excluding window
         past_kv_len = seq_len - self.window_size
-        key_past = past_key_values.key_cache[layer_idx][:, :, :past_kv_len, :]  # [B, H, S-w, D]
+        key_past = past_key_values.key_cache[layer_idx][:, :, :past_kv_len, :]  # [B, H_kv, S-w, D]
         value_past = past_key_values.value_cache[layer_idx][:, :, :past_kv_len, :]
-
-        total_padded_tokens = 0
-
-        for h in range(num_kv_heads):
-            k = max(head_budgets_grouped[h], self.window_size)
-
-            # Top-k indices for head h
-            scores = attn_cache[:, h, :]  # [B, S-window]
-            topk_indices = scores.topk(k, dim=-1).indices  # [B, k]
-            topk_indices = topk_indices.unsqueeze(-1).expand(-1, -1, head_dim)  # [B, k, D]
-
-            # Gather K/V tokens for this head
-            key_sel = key_past[:, h].gather(dim=1, index=topk_indices)  # [B, k, D]
-            value_sel = value_past[:, h].gather(dim=1, index=topk_indices)
-
-            # print the shapes of selected keys and values
-            print(f"[CAKE] Layer {layer_idx}, Head {h}: Selected key shape: {key_sel.shape}, Selected value shape: {value_sel.shape}")
-
-            # Pad if needed
-            pad_len = max_k - k
-            if pad_len > 0:
-                total_padded_tokens += pad_len
-                pad_shape = (bsz, pad_len, head_dim)
-                eps = 1e-6
-                key_pad = torch.full(pad_shape, eps, device=device, dtype=key_sel.dtype)
-                value_pad = torch.full(pad_shape, eps, device=device, dtype=value_sel.dtype)
-
-                key_sel = torch.cat([key_pad, key_sel], dim=1)  # [B, max_k, D]
-                value_sel = torch.cat([value_pad, value_sel], dim=1)
-
-            print(f"[CAKE] Layer {layer_idx}, Head {h}: After padding, key shape: {key_sel.shape}, value shape: {value_sel.shape}")
-            new_key_cache.append(key_sel)
-            new_value_cache.append(value_sel)
-
-        # Stack across heads: [B, H, max_k, D]
-        key_compressed = torch.stack(new_key_cache, dim=1)
-        value_compressed = torch.stack(new_value_cache, dim=1)
-
-        print(f"[CAKE] Layer {layer_idx}: Total padded positions this eviction: {total_padded_tokens}")
-
-        # Keep the current window (last W tokens)
-        key_window = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]
+        key_window = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]  # [B, H_kv, w, D]
         value_window = past_key_values.value_cache[layer_idx][:, :, -self.window_size:, :]
+        
+        # print(f"past_kv_len: {past_kv_len}")
+        # print(f"key_past shape: {key_past.shape}")
+        # print(f"key_window shape: {key_window.shape}")
+        
+        # Prepare query for varlen - one query per head sequence
+        num_q_groups = H // num_kv_heads  # typically 32 // 8 = 4
+        q_varlen = query_states.transpose(1, 2).reshape(B * Q, num_kv_heads, num_q_groups, D)  # [1, 8, 4, 128]
+        q_varlen = q_varlen.reshape(B * Q * num_kv_heads, num_q_groups, D)  # [8, 4, 128]
 
-        # Concatenate compressed + window → final [B, H, max_k + W, D]
-        key_final = torch.cat([key_compressed, key_window], dim=2)
-        value_final = torch.cat([value_compressed, value_window], dim=2)
+        # print(f"q_varlen shape: {q_varlen.shape}")
+        
+        # Create separate sequences for each head (this is the key change!)
+        # Pre-calculate total size and allocate once
+        # Each head gets exactly its budget (which includes the window)
+        total_tokens = sum(head_budgets_grouped[h] for h in range(num_kv_heads))
+        k_varlen = torch.empty(total_tokens, 1, head_dim, device=device, dtype=key_past.dtype)
+        v_varlen = torch.empty(total_tokens, 1, head_dim, device=device, dtype=value_past.dtype)
 
-        # Update cache
-        past_key_values.key_cache[layer_idx] = key_final
-        past_key_values.value_cache[layer_idx] = value_final
+        # Track cumulative sequence lengths
+        cu_seqlens_k = [0]
+        start_idx = 0
 
-        print("[CAKE] After eviction, key cache shape:", key_final.shape)
-        print("[CAKE] After eviction, value cache shape:", value_final.shape)
-
-        return past_key_values
-
-    # def __call__(self, past_key_values, attn_score_cache, layer_idx):
-
-    #     print("[CAKE] total budget for layer", layer_idx, ":", self.hh_size)
-    #     num_heads = attn_score_cache.shape[1]
-
+        for b in range(B):  # Usually B=1
+            for h_kv in range(num_kv_heads):
+                budget = max(head_budgets_grouped[h_kv] - self.window_size, 0)  # e.g., 1024 - 32 = 992
+                
+                if budget > 0:
+                    # Select top-k tokens from past (excluding window)
+                    scores = attn_cache[b, h_kv, :]  # [S-window]
+                    
+                    if budget > len(scores):
+                        budget = len(scores)
+                    
+                    _, topk_indices = scores.topk(budget, dim=-1)  # Optimized: don't store values
+                    
+                    # Gather selected tokens
+                    selected_k_past = key_past[b, h_kv, topk_indices, :]  # [budget, D]
+                    selected_v_past = value_past[b, h_kv, topk_indices, :]  # [budget, D]
+                else:
+                    # No tokens selected from past
+                    selected_k_past = torch.empty(0, head_dim, device=device, dtype=key_past.dtype)
+                    selected_v_past = torch.empty(0, head_dim, device=device, dtype=value_past.dtype)
+                
+                # Add window tokens (always keep these)
+                k_head_window = key_window[b, h_kv, :, :]  # [window, D]
+                v_head_window = value_window[b, h_kv, :, :]  # [window, D]
+                
+                # Concatenate selected + window for this head
+                k_head_total = torch.cat([selected_k_past, k_head_window], dim=0)  # [budget+window, D]
+                v_head_total = torch.cat([selected_v_past, v_head_window], dim=0)  # [budget+window, D]
+                
+                # Fill directly into pre-allocated tensor
+                end_idx = start_idx + len(k_head_total)
+                k_varlen[start_idx:end_idx, 0, :] = k_head_total
+                v_varlen[start_idx:end_idx, 0, :] = v_head_total
+                
+                # Update cumulative sequence lengths
+                cu_seqlens_k.append(cu_seqlens_k[-1] + len(k_head_total))
+                start_idx = end_idx
+        
+        # print(f"Final k_varlen shape: {k_varlen.shape}")
+        # print(f"Final v_varlen shape: {v_varlen.shape}")
+        
+        
+        
+        # Now cu_seqlens_k represents: [0, head0_len, head0_len+head1_len, ...]
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
+        
+        # Query metadata needs to match the number of head sequences
+        cu_seqlens_q = torch.arange(0, B * Q * num_kv_heads + 1, dtype=torch.int32, device=device)  # [0, 1, 2, ..., 8]
+        
+        max_seqlen_q = 1
+        # max_seqlen_k = max(len(seq) for seq in k_varlen_list) if k_varlen_list else 0
+        # Calculate max_seqlen_k from cumulative sequence lengths
+        max_seqlen_k = max(cu_seqlens_k[i+1] - cu_seqlens_k[i] for i in range(len(cu_seqlens_k)-1)) if len(cu_seqlens_k) > 1 else 0     
+        # print(f"Metadata:")
+        # print(f"  cu_seqlens_q: {cu_seqlens_q}")
+        # print(f"  cu_seqlens_k: {cu_seqlens_k}")
+        # print(f"  max_seqlen_q: {max_seqlen_q}")
+        # print(f"  max_seqlen_k: {max_seqlen_k}")
+        # print(f"  Number of head sequences: {len(k_varlen_list)}")
+        # print(f"=== END DEBUG ===\n")
+        
+        eviction_timing['varlen_preparation'] = time.time() - varlen_start
+        eviction_timing['total_eviction'] = time.time() - eviction_start_time
+        eviction_timing['total_selected_tokens'] = int(len(k_varlen))
+        eviction_timing['max_seqlen_k'] = int(max_seqlen_k)
+        
+        # Write eviction timing to file
+        serializable_timing = {}
+        for key, value in eviction_timing.items():
+            if hasattr(value, 'item'):
+                serializable_timing[key] = value.item()
+            elif isinstance(value, (int, float, str, bool)):
+                serializable_timing[key] = value
+            else:
+                serializable_timing[key] = str(value)
+        
+        with open(f"eviction_timing_layer_{layer_idx}.json", "a") as f:
+            f.write(json.dumps(serializable_timing) + '\n')
+        
+        return past_key_values, q_varlen, k_varlen, v_varlen, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
     #     # shape of key value cache
     #     print("[CAKE] Key cache shape:", past_key_values.key_cache[layer_idx].shape)
     #     print("[CAKE] Value cache shape:", past_key_values.value_cache[layer_idx].shape)

@@ -1,5 +1,7 @@
 import math
 from typing import Optional, Tuple
+import time
+import threading
 
 import torch
 from torch import nn
@@ -10,6 +12,13 @@ import transformers
 
 from transformers.models.llama.modeling_llama import *
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
+try:
+    from flash_attn import flash_attn_varlen_func
+    HAS_FLASH_VARLEN = True
+except ImportError:
+    print("Warning: flash_attn_varlen_func not available, falling back to regular flash attention")
+    HAS_FLASH_VARLEN = False
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
@@ -27,6 +36,24 @@ import json
 layer_logs = {}  # global dict to store scores for debugging
 prefill_head_norms = {}
 
+# Global timing accumulator for detailed timing
+timing_lock = threading.Lock()
+global_timing_stats = {
+    'prefill_setup': 0.0,
+    'attention_computation': 0.0,
+    'masking_time': 0.0,
+    'softmax_time': 0.0,
+    'eviction_time': 0.0,
+    'varlen_selection_time': 0.0,
+    'varlen_preparation_time': 0.0,
+    'varlen_flash_attention_time': 0.0,
+    'flash_attention_time': 0.0,
+    'output_processing': 0.0,
+    'total_forward_calls': 0
+}
+
+# prepare_varlen_attention function removed - functionality moved to CakeDecodingKVCache_LayerWise
+
 def llama_attn_forward_cake(
     self,
     hidden_states: torch.Tensor,
@@ -39,6 +66,9 @@ def llama_attn_forward_cake(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
+    forward_start_time = time.time()
+    local_timing = {}
+
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -47,7 +77,8 @@ def llama_attn_forward_cake(
     if isinstance(past_key_value, DynamicCache):
         past_key_value = CakeCache.from_dynamic_cache(past_key_value)
     
-    # Initialize decoding eviction cache when budgets are available
+    # Timing: Initial setup and projections
+    setup_start = time.time()
     if (self.config.decoding_evict[self.layer_idx] is None and 
         hasattr(past_key_value, 'layer_budget') and 
         len(past_key_value.layer_budget) > self.layer_idx):
@@ -96,160 +127,162 @@ def llama_attn_forward_cake(
     value_states = repeat_kv(value_states, self.num_key_value_groups)
     dropout_rate = 0.0 if not self.training else self.attention_dropout
 
-    is_prefill = False
+
+    local_timing['setup_projections'] = time.time() - setup_start
+
+    is_prefill = q_len != 1
 
 
-
-    if self.config.prefill[self.layer_idx]:
-        is_prefill = True
-        
+    # Timing: Prefill phase
+    prefill_start = time.time()
+    # if self.config.prefill[self.layer_idx]:
+    if is_prefill:
         # Initialize budgets on first prefill layer if not done yet
         if past_key_value.head_budgets is None and hasattr(self.config, 'head_budgets'):
             past_key_value.initialize_budgets(self.config.head_budgets)
             
-            # Check sequence length to determine if eviction is needed
-            total_seq_len = past_key_value.get_seq_length() + q_len
-            if total_seq_len <= self.config.cache_size + self.config.window_size[self.layer_idx]:
-                past_key_value.turn_off_eviction = True
-                print(f"[CAKE] Sequence length {total_seq_len} <= cache limit, eviction disabled")
+            # # Check sequence length to determine if eviction is needed
+            # total_seq_len = past_key_value.get_seq_length() + q_len
+            # if total_seq_len <= self.config.cache_size + self.config.window_size[self.layer_idx]:
+            #     past_key_value.turn_off_eviction = True
+            #     # print(f"[CAKE] Sequence length {total_seq_len} <= cache limit, eviction disabled")
+            # else:
+            #     past_key_value.turn_off_eviction = False
+            #     # print(f"[CAKE] Sequence length {total_seq_len} > cache limit, eviction enabled")
+
+        # Timing: Tensor reshaping for flash attention
+        reshape_start = time.time()
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # to be able to avoid many of these transpose/reshape/view.
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        dropout_rate = self.attention_dropout if self.training else 0.0
+
+        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # cast them back in the correct dtype just to be sure everything works as expected.
+        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+        # in fp32. (LlamaRMSNorm handles it correctly)
+
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            # Handle the case where the model is quantized
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
             else:
-                past_key_value.turn_off_eviction = False
-                print(f"[CAKE] Sequence length {total_seq_len} > cache limit, eviction enabled")
-        
-        # For static allocation, we don't need to compute actual pref_scores
-        # Just create dummy pref_scores with the correct shape for compatibility
-        # num_heads = self.num_heads
-        # dummy_pref_score = torch.ones(num_heads, device=query_states.device, dtype=torch.float32)
-        
-        # # We still need hh_score for decoding phase, so compute minimal attention weights
-        # tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        # if q_len != 1:
-        #     mask = torch.full((self.config.window_size[self.layer_idx], self.config.window_size[self.layer_idx]), torch.finfo(tmp_attn_weights.dtype).min, device=tmp_attn_weights.device)
-        #     mask_cond = torch.arange(mask.size(-1), device=tmp_attn_weights.device)
-        #     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        #     mask = mask.to(tmp_attn_weights.device)
-        #     tmp_attention_mask = mask[None, None, :, :]
-        #     tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, -self.config.window_size[self.layer_idx]:] += tmp_attention_mask
+                target_dtype = self.q_proj.weight.dtype
 
-        # tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float64)
-        
-        # # Compute hh_score for decoding phase
-        # attention_score = tmp_attn_weights[:, :, -self.config.window_size[self.layer_idx]:, :] 
-        # attn_mean = attention_score.mean(dim = -2)
-        # attn_var = attention_score.var(dim = -2)
-        # attn_cache = attn_mean + self.config.gamma * attn_var
-        # attn_cache = attn_cache[:, :, :-self.config.window_size[self.layer_idx]]
-        # attn_cache = F.avg_pool1d(attn_cache, kernel_size=5, padding=5//2, stride=1)
-        # hh_score = attn_cache
-        # hh_score = torch.nan_to_num(hh_score, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # # Update with dummy pref_score (only shape matters for static allocation)
-        # past_key_value.update_score(dummy_pref_score, hh_score)
-        self.config.prefill[self.layer_idx] = False
-    
-    if self.config.decoding_evict[self.layer_idx] is not None:
-        # print the KV cache shapes after prefill and before eviction
-        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
-        print(f"WE ARE IN LAYER {self.layer_idx}")
-        
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
 
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+        local_timing['tensor_reshape'] = time.time() - reshape_start
 
-        if not past_key_value.turn_off_eviction:
-            
-            tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-            # budget masking, no eviction
-            if hasattr(past_key_value, 'head_budgets') and past_key_value.head_budgets:
-                head_budgets = past_key_value.head_budgets.get(self.layer_idx)
-                if head_budgets is not None:
-                    #print(f"[CAKE] Layer {self.layer_idx} | Applying decoding budget mask: {head_budgets}")
-                    
-                    B, H, Q, S = tmp_attn_weights.shape
-                    device = tmp_attn_weights.device
-
-                    # Build the mask: True means "mask this token"
-                    mask = torch.ones(H, S, dtype=torch.bool, device=device)
-                    for h in range(H):
-                        k = head_budgets[h]
-                        if k > 0:
-                            keep_indices = torch.arange(S - k, S, device=device)
-                            mask[h, keep_indices] = False  # False = not masked (keep)
-                    # === VERIFICATION: Count masked positions ===
-                    total_positions = H * S
-                    masked_positions = mask.sum().item()
-                    kept_positions = total_positions - masked_positions
-                    masking_percentage = (masked_positions / total_positions) * 100
-                    
-                    # print(f"[MASK] Layer {self.layer_idx} | Total: {total_positions}, Masked: {masked_positions}, Kept: {kept_positions}, Masked%: {masking_percentage:.1f}%")
-                    
-                    # Per-head breakdown
-                    masked_per_head = mask.sum(dim=1)  # [H]
-                    kept_per_head = S - masked_per_head
-                    # print(f"[MASK] Layer {self.layer_idx} | Kept per head: {kept_per_head.tolist()}")
-                    # print(f"[MASK] Layer {self.layer_idx} | Expected budgets: {head_budgets}")
-                    # Expand mask for broadcasting: [1, H, 1, S]
-                    attn_mask = mask.unsqueeze(0).unsqueeze(2)  # [1, H, 1, S]
-                    tmp_attn_weights = tmp_attn_weights.masked_fill(attn_mask, float('-inf'))
-
-            tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            # past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx)
-            # print shape of tmp_attn_weights
-            print(f"SHAPE OF tmp_attn_weights: {tmp_attn_weights.shape}")
-
-            past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx, head_budgets)
-
-
-    # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-    # to be able to avoid many of these transpose/reshape/view.
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
-
-    dropout_rate = self.attention_dropout if self.training else 0.0
-
-    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-    # therefore the input hidden states gets silently casted in float32. Hence, we need
-    # cast them back in the correct dtype just to be sure everything works as expected.
-    # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-    # in fp32. (LlamaRMSNorm handles it correctly)
-
-    input_dtype = query_states.dtype
-    if input_dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
-        # Handle the case where the model is quantized
-        elif hasattr(self.config, "_pre_quantization_dtype"):
-            target_dtype = self.config._pre_quantization_dtype
-        else:
-            target_dtype = self.q_proj.weight.dtype
-
-        logger.warning_once(
-            f"The input hidden states seems to be silently casted in float32, this might be related to"
-            f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-            f" {target_dtype}."
+        # Timing: Flash attention call
+        flash_attn_start = time.time()
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
+            sliding_window=getattr(self, "sliding_window", None),
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
+            is_causal=self.is_causal,
         )
-
-        query_states = query_states.to(target_dtype)
-        key_states = key_states.to(target_dtype)
-        value_states = value_states.to(target_dtype)
-
-    attn_output = _flash_attention_forward(
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        q_len,
-        dropout=dropout_rate,
-        sliding_window=getattr(self, "sliding_window", None),
-        use_top_left_mask=self._flash_attn_uses_top_left_mask,
-        is_causal=self.is_causal,
-    )
-
-    # attn_output rn has shape (batch_size, query_length, num_heads, head_dim)
-
-    # data structure to store the norms of the heads, so 32 heads and 32 layers, so 32x32 norms in the prefill phase
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        local_timing['flash_attention_time'] = time.time() - flash_attn_start
+        self.config.prefill[self.layer_idx] = False
+    local_timing['prefill_setup'] = time.time() - prefill_start
     
+    # Timing: Decoding eviction phase
+    decoding_start = time.time()
+    # if self.config.decoding_evict[self.layer_idx] is not None:
+    if not is_prefill:
+        # print the KV cache shapes after prefill and before eviction
+        # print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
+        # print(f"WE ARE IN LAYER {self.layer_idx}")
+
+        attn_comp_start = time.time()
+        tmp_attn_weights = torch.matmul(query_states[..., -self.config.window_size[self.layer_idx]:, :], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        local_timing['attention_computation'] = time.time() - attn_comp_start
+        # Timing: Attention computation for eviction
+
+        # NEW: Varlen Flash Attention Path (replaces masking + eviction + padding)
+        if hasattr(past_key_value, 'head_budgets') and past_key_value.head_budgets and HAS_FLASH_VARLEN:
+            head_budgets = past_key_value.head_budgets.get(self.layer_idx)
+            if head_budgets is not None:
+                # Timing: Varlen eviction and preparation
+                varlen_selection_start = time.time()
+
+                # Softmax for attention scores (needed for token selection)
+                tmp_attn_weights_softmax = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32)
+
+                # Call eviction with varlen preparation - this replaces masking + eviction + padding
+                result = self.config.decoding_evict[self.layer_idx](
+                    past_key_value, 
+                    tmp_attn_weights_softmax, 
+                    self.layer_idx, 
+                    head_budgets,
+                    query_states=query_states
+                )
+                past_key_value, q_varlen, k_varlen, v_varlen, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = result
+
+                        
+                local_timing['varlen_selection_time'] = time.time() - varlen_selection_start
+                        
+                        # Timing: Varlen flash attention call
+                varlen_flash_start = time.time()
+                attn_output = flash_attn_varlen_func(
+                    q_varlen,
+                    k_varlen, 
+                    v_varlen,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    causal=True
+                )  # Returns (total_q, nheads, headdim)
+                local_timing['varlen_flash_attention_time'] = time.time() - varlen_flash_start
+                        
+                # Reshape back to original format
+                # B, Q = query_states.shape[0], query_states.shape[2] 
+                # attn_output = attn_output.reshape(B, self.num_heads, Q, self.head_dim)
+                # attn_output = attn_output.transpose(1, 2).reshape(B, Q, self.hidden_size)
+                
+
+                ##### THIS VERSION WORKS ######
+                # B, Q = query_states.shape[0], query_states.shape[2]
+                # num_kv_heads = self.num_key_value_heads  # Usually 8 for Llama
+                # num_q_groups = self.num_heads // num_kv_heads  # Usually 32 // 8 = 4
+
+                # # attn_output from flash_attn_varlen_func has shape [8, 4, 128] 
+                # # We need to reshape it back to [B, Q, num_heads, head_dim] = [1, 1, 32, 128]
+                # attn_output = attn_output.reshape(B * Q * num_kv_heads, num_q_groups, self.head_dim)  # [8, 4, 128]
+                # attn_output = attn_output.reshape(B, Q, num_kv_heads * num_q_groups, self.head_dim)  # [1, 1, 32, 128]
+                # attn_output = attn_output.reshape(B, Q, self.hidden_size)  # [1, 1, 4096]
+                ##############################
+
+                #### EFFICIENT
+
+                # Replace the entire reshape section with this single line:
+                B, Q = query_states.shape[0], query_states.shape[2]
+                # attn_output from flash_attn_varlen_func has shape [8, 4, 128]
+                # Direct reshape to final format: [B, Q, hidden_size]
+                attn_output = attn_output.reshape(B, Q, self.hidden_size)  # [1, 1, 4096]
+    
+    local_timing['decoding_total'] = time.time() - decoding_start
+
     # we will find the norms for each layer in this if statement and then add them to the prefill_head_norms dict
     # if is_prefill:
     #     head_norms = torch.norm(attn_output, p=2, dim=-1)  # shape: (batch_size, query_length, num_heads)
@@ -272,23 +305,34 @@ def llama_attn_forward_cake(
     #         with open(f"sample_xyz_prefill_norms.tmp", "w") as f:
     #             json.dump({"prefill": prefill_head_norms}, f, indent=2)
 
-
-    # else:
-    #     # decoding now
-    #     head_norms = torch.norm(attn_output, p=2, dim=-1).squeeze(0).squeeze(0).detach().cpu().numpy().tolist()
-    #     with open("sample_xyz_decoding_norms.tmp", "a") as f:
-    #         f.write(json.dumps({str(self.layer_idx): head_norms}) + '\n')
-
-
-        # print(f"[CAKE] Layer {self.layer_idx} | head norms shape = {head_norms.shape}")
-        # print(f"[CAKE] Layer {self.layer_idx} | head norms sample = {head_norms[:32].detach().cpu().numpy()}"
-
-    # when the prefill is done, I will have a dict with 32 keys (one for each layer) and each value will be a list of 32 head norms, attach that to past_key_value
-
+    # Timing: Final output processing
+    output_start = time.time()
     # print(f"[CAKE] Layer {self.layer_idx} | attn_output shape = {attn_output.shape}")
-    attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+    # attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
     # print(f"[CAKE] Layer {self.layer_idx} | attn_output reshaped shape = {attn_output.shape}") # should be (batch_size, query_length, num_heads * head_dim)
     attn_output = self.o_proj(attn_output)
+    local_timing['output_processing'] = time.time() - output_start
+    
+    # Accumulate timing statistics globally
+    local_timing['total_forward'] = time.time() - forward_start_time
+    with timing_lock:
+        global_timing_stats['total_forward_calls'] += 1
+        for key, value in local_timing.items():
+            if key not in global_timing_stats:
+                global_timing_stats[key] = 0.0
+            global_timing_stats[key] += value
+        
+        # Write detailed per-layer timing every 10 calls for debugging
+        if global_timing_stats['total_forward_calls'] % 10 == 0:
+            avg_stats = {k: v/global_timing_stats['total_forward_calls'] if k != 'total_forward_calls' else v 
+                        for k, v in global_timing_stats.items()}
+            timing_file = f"layer_timing_stats_layer_{self.layer_idx}.json"
+            with open(timing_file, 'w') as f:
+                json.dump({
+                    "layer_idx": self.layer_idx,
+                    "current_timing": local_timing,
+                    "cumulative_avg": avg_stats
+                }, f, indent=2)
 
     if not output_attentions:
         attn_weights = None

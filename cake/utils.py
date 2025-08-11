@@ -40,7 +40,7 @@ def precompute_static_head_budgets(
     Returns:
         Dict[layer_idx] = List[head_budgets] for each layer
     """
-    print(f"[CAKE] Pre-computing static head budgets from {importance_file_path}")
+    # print(f"[CAKE] Pre-computing static head budgets from {importance_file_path}")
     
     # Load importance scores once
     importance_scores = np.load(importance_file_path)
@@ -115,8 +115,8 @@ def precompute_static_head_budgets(
         layer_budgets = raw_budgets[start_idx:end_idx].tolist()
         head_budgets[layer_idx] = layer_budgets
     
-    print(f"[CAKE] Pre-computed budgets for {num_layers} layers, {num_heads} heads each")
-    print(f"[CAKE] Total budget: {total_budget}, Actual allocated: {sum(sum(budgets) for budgets in head_budgets.values())}")
+    # print(f"[CAKE] Pre-computed budgets for {num_layers} layers, {num_heads} heads each")
+    # print(f"[CAKE] Total budget: {total_budget}, Actual allocated: {sum(sum(budgets) for budgets in head_budgets.values())}")
     
     return head_budgets
 
@@ -327,6 +327,8 @@ def compute_head_budgets_dynamic(pref_scores: List[torch.Tensor], total_budget: 
     #     offset += num_heads
     
     return out
+
+# run co
 
 
 

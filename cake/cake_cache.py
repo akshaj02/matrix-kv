@@ -211,7 +211,9 @@ class CakeprefillKVCache:
     ):
 
         self.window_size = window_size
-        self.total_size = (cache_size-window_size) * num_layers * num_heads # might have to change
+        # self.total_size = (cache_size-window_size) * num_layers * num_heads # might have to change
+        self.total_size = (cache_size-window_size) * num_layers # might have to change
+
         self.cache_size = cache_size
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
@@ -238,6 +240,7 @@ class CakeprefillKVCache:
             allocation_strategy="static",
             max_seq_len=self.cache_size
         )
+        print(head_budgets)
         # Store head budgets in the CakeCache object
         past_key_values.head_budgets = head_budgets
         # print(f"[CAKE] Head Budgets: {head_budgets}")
@@ -339,7 +342,7 @@ class CakeDecodingKVCache_LayerWise:
 
         # Step 5: Get indices per KV head
         max_k = max([max(k, self.window_size) for k in head_budgets_grouped])
-        print(f"[CAKE] For layer {layer_idx}, max_k (for padding): {max_k}")
+        # print(f"[CAKE] For layer {layer_idx}, max_k (for padding): {max_k}")
         
         new_key_cache = []
         new_value_cache = []
@@ -364,7 +367,7 @@ class CakeDecodingKVCache_LayerWise:
             value_sel = value_past[:, h].gather(dim=1, index=topk_indices)
 
             # print the shapes of selected keys and values
-            print(f"[CAKE] Layer {layer_idx}, Head {h}: Selected key shape: {key_sel.shape}, Selected value shape: {value_sel.shape}")
+            # print(f"[CAKE] Layer {layer_idx}, Head {h}: Selected key shape: {key_sel.shape}, Selected value shape: {value_sel.shape}")
 
             # Pad if needed
             pad_len = max_k - k
@@ -378,7 +381,7 @@ class CakeDecodingKVCache_LayerWise:
                 key_sel = torch.cat([key_pad, key_sel], dim=1)  # [B, max_k, D]
                 value_sel = torch.cat([value_pad, value_sel], dim=1)
 
-            print(f"[CAKE] Layer {layer_idx}, Head {h}: After padding, key shape: {key_sel.shape}, value shape: {value_sel.shape}")
+            # print(f"[CAKE] Layer {layer_idx}, Head {h}: After padding, key shape: {key_sel.shape}, value shape: {value_sel.shape}")
             new_key_cache.append(key_sel)
             new_value_cache.append(value_sel)
 
@@ -386,7 +389,7 @@ class CakeDecodingKVCache_LayerWise:
         key_compressed = torch.stack(new_key_cache, dim=1)
         value_compressed = torch.stack(new_value_cache, dim=1)
 
-        print(f"[CAKE] Layer {layer_idx}: Total padded positions this eviction: {total_padded_tokens}")
+        # print(f"[CAKE] Layer {layer_idx}: Total padded positions this eviction: {total_padded_tokens}")
 
         # Keep the current window (last W tokens)
         key_window = past_key_values.key_cache[layer_idx][:, :, -self.window_size:, :]
@@ -400,8 +403,8 @@ class CakeDecodingKVCache_LayerWise:
         past_key_values.key_cache[layer_idx] = key_final
         past_key_values.value_cache[layer_idx] = value_final
 
-        print("[CAKE] After eviction, key cache shape:", key_final.shape)
-        print("[CAKE] After eviction, value cache shape:", value_final.shape)
+        # print("[CAKE] After eviction, key cache shape:", key_final.shape)
+        # print("[CAKE] After eviction, value cache shape:", value_final.shape)
 
         return past_key_values
 

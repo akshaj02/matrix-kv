@@ -68,6 +68,12 @@ def build_chat(tokenizer, prompt, model_name):
 def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, cache_size):
     sample_num = 0
     for json_obj in tqdm(data):
+    # just use first 10 samples in data
+    # for json_obj in tqdm(data[:10]):
+        # Set current sample ID for head norm tracking
+        # from cake.model.modify_llama import set_sample_id
+        # set_sample_id(sample_num)
+        
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
@@ -165,6 +171,9 @@ def get_pred(model, tokenizer, compress, data, max_length, max_gen, prompt_forma
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
             f.write('\n')
+        
+        # Increment sample counter
+        sample_num += 1
 
 
 def seed_everything(seed):
@@ -276,6 +285,14 @@ if __name__ == '__main__':
         os.makedirs(f"./pred_result/{cache_name}/{pred_name}")
     
     for dataset in datasets:
+        # Set environment variable for dataset-specific head norm tracking
+        # os.environ['DATASET_NAME'] = dataset
+        # print(f"Processing dataset: {dataset}")
+        
+        # # Reset sample counter for new dataset
+        # from cake.model.modify_llama import reset_sample_counter
+        # reset_sample_counter()
+        
         #load offline 
         data_files = {"test": f"{dataset}.jsonl"}
         data = load_dataset("json", data_dir='./datasets/longbench/data', split='test', data_files=data_files)

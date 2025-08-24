@@ -21,11 +21,50 @@ from ..cake_cache import CakeCache, CakeDecodingKVCache_LayerWise
 from ..utils import calculate_entropy
 
 import json
+import os
 
 # modify_llama.py
 
 layer_logs = {}  # global dict to store scores for debugging
 prefill_head_norms = {}
+
+# Global variable to store current dataset name
+current_dataset = None
+
+def get_dataset_name():
+    """
+    Try to detect the current dataset being processed from environment variables or command line args.
+    Falls back to 'unknown_dataset' if detection fails.
+    """
+    global current_dataset
+    if current_dataset is not None:
+        return current_dataset
+    
+    # Try to get from environment variable
+    dataset_name = os.environ.get('DATASET_NAME', None)
+    if dataset_name:
+        current_dataset = dataset_name
+        return current_dataset
+    
+    # Try to detect from common LongBench dataset names in sys.argv
+    import sys
+    longbench_datasets = ['narrativeqa', 'qasper', 'multifieldqa_en', 'hotpotqa', 'passage_retrieval_en', 
+                         'trec', 'triviaqa', 'samsum', 'passage_count', 'lcc', 'repobench-p']
+    
+    for arg in sys.argv:
+        for dataset in longbench_datasets:
+            if dataset.lower() in arg.lower():
+                current_dataset = dataset
+                return current_dataset
+    
+    # Default fallback
+    current_dataset = 'unknown_dataset'
+    return current_dataset
+
+def set_dataset_name(name):
+    """Manually set the dataset name"""
+    global current_dataset
+    current_dataset = name
 
 def llama_attn_forward_cake(
     self,
@@ -149,8 +188,8 @@ def llama_attn_forward_cake(
     
     if self.config.decoding_evict[self.layer_idx] is not None:
         # print the KV cache shapes after prefill and before eviction
-        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
-        print(f"WE ARE IN LAYER {self.layer_idx}")
+        # print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
+        # print(f"WE ARE IN LAYER {self.layer_idx}")
         
 
 
@@ -194,7 +233,7 @@ def llama_attn_forward_cake(
             tmp_attn_weights = nn.functional.softmax(tmp_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             # past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx)
             # print shape of tmp_attn_weights
-            print(f"SHAPE OF tmp_attn_weights: {tmp_attn_weights.shape}")
+            # print(f"SHAPE OF tmp_attn_weights: {tmp_attn_weights.shape}")
 
             past_key_value = self.config.decoding_evict[self.layer_idx](past_key_value, tmp_attn_weights, self.layer_idx, head_budgets)
 
@@ -249,7 +288,10 @@ def llama_attn_forward_cake(
 
     # data structure to store the norms of the heads, so 32 heads and 32 layers, so 32x32 norms in the prefill phase
     
-    # we will find the norms for each layer in this if statement and then add them to the prefill_head_norms dict
+    # Get dataset name for file naming
+    # dataset_name = get_dataset_name()
+    
+    # # we will find the norms for each layer in this if statement and then add them to the prefill_head_norms dict
     # if is_prefill:
     #     head_norms = torch.norm(attn_output, p=2, dim=-1)  # shape: (batch_size, query_length, num_heads)
     #     # print(f"[CAKE] Layer {self.layer_idx} | head norms shape = {head_norms.shape}")
@@ -267,17 +309,48 @@ def llama_attn_forward_cake(
 
     #     prefill_head_norms.update({self.layer_idx: head_norms})  # update the dict with the head norms for this layer
     #     if self.layer_idx == self.config.num_hidden_layers - 1:
-    #     # Save to disk (write prefill norms as the base of your sample JSON)
-    #         with open(f"sample_xyz_prefill_norms.tmp", "w") as f:
-    #             json.dump({"prefill": prefill_head_norms}, f, indent=2)
-
+    #         # Save to disk with dataset-specific filename
+    #         norms_filename = f"head_norms_{dataset_name}.json"
+    #         # Create the initial structure with prefill data
+    #         norms_data = {
+    #             "dataset": dataset_name,
+    #             "prefill": prefill_head_norms,
+    #             "decoding": {}
+    #         }
+    #         with open(norms_filename, "w") as f:
+    #             json.dump(norms_data, f, indent=2)
+    #         print(f"[NORMS] Saved prefill norms for {dataset_name} to {norms_filename}")
 
     # else:
     #     # decoding now
     #     head_norms = torch.norm(attn_output, p=2, dim=-1).squeeze(0).squeeze(0).detach().cpu().numpy().tolist()
-    #     with open("sample_xyz_decoding_norms.tmp", "a") as f:
-    #         f.write(json.dumps({str(self.layer_idx): head_norms}) + '\n')
-
+        
+    #     # Load existing data if file exists, otherwise create new structure
+    #     norms_filename = f"head_norms_{dataset_name}.json"
+    #     try:
+    #         with open(norms_filename, "r") as f:
+    #             norms_data = json.load(f)
+    #     except FileNotFoundError:
+    #         # Create new structure if file doesn't exist
+    #         norms_data = {
+    #             "dataset": dataset_name,
+    #             "prefill": {},
+    #             "decoding": {}
+    #         }
+        
+    #     # Add decoding norms for this layer
+    #     if "decoding" not in norms_data:
+    #         norms_data["decoding"] = {}
+        
+    #     layer_key = str(self.layer_idx)
+    #     if layer_key not in norms_data["decoding"]:
+    #         norms_data["decoding"][layer_key] = []
+        
+    #     norms_data["decoding"][layer_key].append(head_norms)
+        
+    #     # Save updated data
+    #     with open(norms_filename, "w") as f:
+    #         json.dump(norms_data, f, indent=2)
 
         # print(f"[CAKE] Layer {self.layer_idx} | head norms shape = {head_norms.shape}")
         # print(f"[CAKE] Layer {self.layer_idx} | head norms sample = {head_norms[:32].detach().cpu().numpy()}"

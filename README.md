@@ -2,25 +2,17 @@
 
 ## Overview
 
-Matrix-KV extends KV cache management with **head-level entropy-based budget allocation**, moving beyond uniform layer-wise allocation to optimize cache distribution at individual attention head granularity.
+Matrix-KV extends KV cache management with **head-level budget allocation**, moving beyond uniform layer-wise allocation to optimize cache distribution at individual attention head granularity.
 
 ## What We're Achieving
 
 **Head-wise Cache Optimization**: Instead of allocating uniform budgets to all heads within a layer, Matrix-KV computes individual preference scores for each attention head and allocates cache budgets proportionally based on attention entropy patterns.
 
-**Entropy-driven Resource Distribution**: High-entropy heads (dispersed attention) receive more cache budget, while low-entropy heads (concentrated attention) get minimal allocation, eliminating systematic over-allocation.
-
 ## Current Implementation Status
 
 ### ✅ Completed
 
-- **Head-level preference calculation**: Individual entropy scoring for each attention head across all layers
-- **Entropy-based budget allocation**: Dynamic budget distribution proportional to attention dispersion patterns
-- **Budget tracking without eviction**: Cache allocation optimization while maintaining full sequence lengths
-- **LongBench Evaluation**: Evaluated this system on the LongBench dataset, achieveing better performance than CAKE across multiple datasets.
-
-### 🚧 In Progress
-
+- **Head-level preference calculation**: Individual scoring for each attention head across all layers
 - **Variable-length FlashAttention integration**: Required for actual KV cache eviction with different head budgets
 - **Token eviction implementation**: Currently only allocating budgets, not performing actual cache reduction
 
@@ -28,7 +20,7 @@ Matrix-KV extends KV cache management with **head-level entropy-based budget all
 
 | Method | NrtvQA | Qasper | MF-en | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PCount | PR-en | Lcc | RB-P | **Avg.** |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| **CAKE++ (Ours)** | **30.95** | **46.02** | **53.49** | 55.35 | **47.13** | 30.73 | **34.70** | **25.02** | **27.54** | **73.00** | 91.48 | **43.83** | **6.00** | **99.50** | **63.34** | 56.28 | **49.02** |
+| **MatrixKV (Ours)** | **30.95** | **46.02** | **53.49** | 55.35 | **47.13** | 30.73 | **34.70** | **25.02** | **27.54** | **73.00** | 91.48 | **43.83** | **6.00** | **99.50** | **63.34** | 56.28 | **49.02** |
 | CAKE | 30.88 | 44.95 | 52.38 | **55.49** | 46.99 | **30.82** | 28.68 | 24.91 | 26.39 | 69.00 | **91.94** | 42.60 | **6.00** | **99.50** | 62.65 | **56.89** | 48.13 |
 | SnapKV | **30.95** | 44.74 | 52.58 | 55.09 | 46.83 | 30.37 | 27.87 | 24.57 | 25.99 | 68.00 | 92.03 | 42.60 | 6.50 | **99.50** | 63.00 | 56.50 | 47.95 |
 | PyramidKV | 30.54 | 43.64 | 52.73 | 55.29 | 46.29 | 31.28 | 27.53 | 24.50 | 26.00 | 68.00 | 92.09 | 41.75 | 6.05 | **99.50** | 62.35 | 55.44 | 47.69 |

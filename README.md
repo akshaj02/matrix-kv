@@ -15,12 +15,6 @@ Matrix-KV extends KV cache management with **head-level entropy-based budget all
 ### ✅ Completed
 
 - **Head-level preference calculation**: Individual entropy scoring for each attention head across all layers
-- **Entropy-based budget allocation**: Dynamic budget distribution proportional to attention dispersion patterns
-- **Budget tracking without eviction**: Cache allocation optimization while maintaining full sequence lengths
-
-
-### 🚧 In Progress
-
 - **Variable-length FlashAttention integration**: Required for actual KV cache eviction with different head budgets
 - **Token eviction implementation**: Currently only allocating budgets, not performing actual cache reduction
 
